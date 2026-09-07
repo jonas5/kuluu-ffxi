@@ -490,22 +490,68 @@ pub fn process_load_mmb_requests(
                     + s.indices.len() * 4;
             }
         }
-        let (unique_tex, bank_files) = {
+        // CPU-side decoded raster lives once per resident file (the shared bank).
+        // Count resident files and the chunk-parses that reference each one, to
+        // prove decoded memory is bounded by FILE count, not chunk count.
+        let (unique_tex, bank_files, refs_per_file) = {
             let bank = mmb_file_textures_bank().lock().unwrap();
+            let mut refs: std::collections::HashMap<u32, usize> = Default::default();
+            for (file_id, _) in parse_cache.by_asset.keys() {
+                if bank.contains_key(file_id) {
+                    *refs.entry(*file_id).or_insert(0) += 1;
+                }
+            }
             (
                 bank.values()
                     .map(|v| v.iter().map(|t| t.texture.rgba.len()).sum::<usize>())
                     .sum::<usize>(),
                 bank.len(),
+                refs,
             )
         };
+        // GPU-side: the pooled Assets<Image> bytes per resident file (one upload
+        // per file, shared by every placement). Distinguishes the intended 2x
+        // hold (CPU decode + GPU Image) from any per-chunk duplication.
+        let mut gpu_by_file: Vec<(u32, usize, usize)> = Vec::new();
+        for (fid, (by_name, _)) in &tex_pools_res.by_file {
+            let mut gpu_bytes = 0usize;
+            for h in by_name.values() {
+                if let Some(img) = images.get(h) {
+                    gpu_bytes += img.data.as_ref().map(|d| d.len()).unwrap_or(0);
+                }
+            }
+            gpu_by_file.push((*fid, gpu_bytes, by_name.len()));
+        }
+        gpu_by_file.sort_by_key(|(fid, _, _)| *fid);
+        let gpu_total: usize = gpu_by_file.iter().map(|(_, b, _)| b).sum();
+        let bank_guard = mmb_file_textures_bank().lock().unwrap();
+        let mut per_file: Vec<String> = gpu_by_file
+            .iter()
+            .map(|(fid, g, n)| {
+                let cpu = bank_guard
+                    .get(fid)
+                    .map(|set| set.iter().map(|t| t.texture.rgba.len()).sum::<usize>())
+                    .unwrap_or(0);
+                let chunk_refs = refs_per_file.get(fid).copied().unwrap_or(0);
+                format!(
+                    "fid {fid}: cpu {:.1}MB gpu {:.1}MB tex {n} chunks {chunk_refs}",
+                    cpu as f64 / 1_048_576.0,
+                    *g as f64 / 1_048_576.0
+                )
+            })
+            .collect();
+        drop(bank_guard);
+        per_file.sort();
         info!(
-            "DIAG mmb cache: n {} geo MB {:.1} shared_tex MB {:.1} (bank files {}) rss_mb {}",
+            "DIAG mmb cache: chunks {} geo MB {:.1} cpu_tex MB {:.1} gpu_tex MB {:.1} (bank files {}; gpu files {}) rss_mb {} per [{}]",
             parse_cache.by_asset.len(),
             sum as f64 / 1_048_576.0,
             unique_tex as f64 / 1_048_576.0,
+            gpu_total as f64 / 1_048_576.0,
             bank_files,
-            diag_rss_mb()
+            gpu_by_file.len(),
+            diag_rss_mb(),
+            per_file.join(" | "),
         );
     }
 
@@ -574,10 +620,25 @@ pub fn process_load_mmb_requests(
         }
     };
 
-    const MMB_SPAWN_BUDGET: usize = 96;
+    // Time-bounded spawn pacing, not a fixed count: pouring 96 placements into
+    // one frame pinned frames to ~6fps while the backdrop flight drained a
+    // ~19k-placement zone (live evidence: ~55s of startup stutter, kuluu-wisp-x1l).
+    // Leave ~2.6ms of a 16.6ms frame for the rest of Update + render so streaming
+    // can't starve frame pacing; the count ceiling still bounds a frame where
+    // placements are pathological-cheap.
+    let frame_budget_ms: u64 = std::env::var("FFXI_MMB_BUDGET_MS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(14);
+    const MMB_SPAWN_FRAME_CEILING: usize = 1024;
     const HEAVY: usize = 8;
     const MMB_MAX_INFLIGHT: usize = 64;
+    let spawn_start = std::time::Instant::now();
     let mut spawned = 0usize;
+    let mut placed = 0usize;
+    let mut place_ns_total = 0u128;
+    let mut pool_ns = 0u128;
+    let mut mesh_ns = 0u128;
     let mut retained: std::collections::VecDeque<LoadMmbRequest> =
         std::collections::VecDeque::with_capacity(queue.pending.len());
 
@@ -619,18 +680,24 @@ pub fn process_load_mmb_requests(
 
                 let pool_exists = tex_pools_res.by_file.contains_key(&req.file_id);
                 let cost = if pool_exists { 1 } else { HEAVY };
-                if spawned > 0 && spawned + cost > MMB_SPAWN_BUDGET {
+                if spawned > 0
+                    && (spawn_start.elapsed().as_millis() as u64 >= frame_budget_ms
+                        || spawned + cost > MMB_SPAWN_FRAME_CEILING)
+                {
                     queue.budget_deferred = true;
                     retained.push_back(req);
-                    continue;
+                    retained.append(&mut queue.pending);
+                    break;
                 }
                 spawned += cost;
 
+                let plc_t0 = std::time::Instant::now();
                 let texture_count = loaded.textures.len();
                 let quality = TextureQuality {
                     mipmaps: settings.texture_filtering.mipmaps(),
                     anisotropy: settings.texture_filtering.anisotropy(),
                 };
+                let pool_t0 = std::time::Instant::now();
                 let pool = tex_pools_res.by_file.entry(req.file_id).or_insert_with(|| {
                     let mut by_name: std::collections::HashMap<String, Handle<Image>> =
                         std::collections::HashMap::with_capacity(texture_count);
@@ -672,6 +739,7 @@ pub fn process_load_mmb_requests(
                 });
                 let tex_by_name = &pool.0;
                 let first_texture = pool.1.clone();
+                pool_ns += pool_t0.elapsed().as_nanos();
 
                 if mmb_logged.insert((req.file_id, req.chunk_idx)) {
                     let mut img_stats: Vec<(String, u8, u8)> = loaded
@@ -786,6 +854,7 @@ pub fn process_load_mmb_requests(
 
                 let n_subs = loaded.submeshes.len();
                 let mut plc_bytes = 0usize;
+                let mesh_t0 = std::time::Instant::now();
                 for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
                     let cache_key = (req.file_id, req.chunk_idx, sub_index);
                     let is_new_mesh = !handle_cache.mesh.contains_key(&cache_key);
@@ -946,9 +1015,10 @@ pub fn process_load_mmb_requests(
                         variant_name: sub.variant_name.trim().to_string(),
                     }));
                 }
+                mesh_ns += mesh_t0.elapsed().as_nanos();
 
                 let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
-                if std::env::var("FFXI_DIAG_STREAM").is_ok() && is_zone_spawn {
+                if std::env::var("FFXI_DIAG_PLC").is_ok() && is_zone_spawn {
                     info!(
                         "DIAG mmb plc: fid {} chunk {} subs {} new_bytes MB {:.1} rss_mb {} name {}",
                         req.file_id,
@@ -982,6 +1052,8 @@ pub fn process_load_mmb_requests(
                         ),
                     );
                 }
+                placed += 1;
+                place_ns_total += plc_t0.elapsed().as_nanos();
             }
             Some(None) => {
                 push_system_msg(
@@ -1010,7 +1082,12 @@ pub fn process_load_mmb_requests(
 
     if std::env::var("FFXI_DIAG_STREAM").is_ok() {
         info!(
-            "DIAG mmb end: spawned {spawned} this pass, pending retained {} rss_mb {}",
+            "DIAG mmb end: spawned {spawned} this pass, placed {placed} avg {:.2}ms (pool {:.2} mesh {:.2} rest {:.2}) spent {:.1}ms budget, pending retained {} rss_mb {}",
+            place_ns_total as f64 / 1_000_000.0 / placed.max(1) as f64,
+            pool_ns as f64 / 1_000_000.0 / placed.max(1) as f64,
+            mesh_ns as f64 / 1_000_000.0 / placed.max(1) as f64,
+            (place_ns_total.saturating_sub(pool_ns + mesh_ns)) as f64 / 1_000_000.0 / placed.max(1) as f64,
+            spawn_start.elapsed().as_secs_f64() * 1000.0,
             queue.pending.len(),
             diag_rss_mb()
         );
