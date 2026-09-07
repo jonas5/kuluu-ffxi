@@ -1,28 +1,4 @@
 {
-  "permissions": {
-    "allow": [
-      "Bash(git add *)",
-      "Bash(git commit *)",
-      "Bash(docker exec server-database-1 mariadb -uxiadmin -ppassword xidb -e \"DELETE FROM accounts_sessions WHERE charid=*)",
-      "Bash(bd show *)",
-      "Bash(bd list *)",
-      "Bash(bd search *)",
-      "Bash(bd ready*)",
-      "Bash(bd stats*)",
-      "Bash(gh release view *)",
-      "Bash(gh release list*)",
-      "Bash(gh run list*)",
-      "Bash(gh run view *)"
-    ],
-    "ask": [
-      "Bash(git push *)",
-      "Bash(git push origin :*)",
-      "Bash(git push --force*)",
-      "Bash(git push -f *)",
-      "Bash(gh release delete *)",
-      "Bash(bd dolt push*)"
-    ]
-  },
   "hooks": {
     "PostToolUse": [
       {
@@ -117,6 +93,15 @@
           }
         ],
         "matcher": "startup|resume|clear|compact"
+      },
+      {
+        "hooks": [
+          {
+            "command": "bd prime --hook-json",
+            "type": "command"
+          }
+        ],
+        "matcher": ""
       }
     ],
     "Stop": [
@@ -128,6 +113,30 @@
           }
         ]
       }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(docker exec server-database-1 mariadb -uxiadmin -ppassword xidb -e \"DELETE FROM accounts_sessions WHERE charid=*)",
+      "Bash(bd show *)",
+      "Bash(bd list *)",
+      "Bash(bd search *)",
+      "Bash(bd ready*)",
+      "Bash(bd stats*)",
+      "Bash(gh release view *)",
+      "Bash(gh release list*)",
+      "Bash(gh run list*)",
+      "Bash(gh run view *)"
+    ],
+    "ask": [
+      "Bash(git push *)",
+      "Bash(git push origin :*)",
+      "Bash(git push --force*)",
+      "Bash(git push -f *)",
+      "Bash(gh release delete *)",
+      "Bash(bd dolt push*)"
     ]
   }
 }

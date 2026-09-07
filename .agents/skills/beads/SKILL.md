@@ -7,21 +7,15 @@ description: Use when working in a repository that uses bd or Beads for durable 
 
 Use Beads as the shared project task system. Local plans, scratch files, and personal memories are useful, but they are not the durable source of truth for project work.
 
-## Kuluu Policy
+## First Step
 
-Read this repository's `AGENTS.md` before using the generic workflow below.
-Its Beads policy intentionally differs from the stock `bd prime` context:
+Run:
 
-- Start routine work with `bd ready` or `bd show <id>`; the shared session
-  hook already supplies the concise project context. Do not inject raw
-  `bd prime` output automatically.
-- Beads is the durable tracker, but `MEMORY.md` remains the cross-session
-  memory system and in-session todos remain ephemeral. Do not migrate either
-  into `bd remember`.
-- The repository profile grants normal commit authority, but push and Dolt
-  sync still require explicit confirmation.
+```bash
+bd prime
+```
 
-If the hook context is absent, verify the workspace with:
+If that prints nothing, check whether the repository has an active Beads workspace:
 
 ```bash
 bd where
@@ -82,5 +76,5 @@ Use agent-local planning tools only for the current turn's execution checklist. 
 - Do not create markdown TODO files as the source of truth when Beads is available.
 - Do not use `bd edit`; it opens an interactive editor. Use `bd update` flags instead.
 - Prefer `--json` when parsing `bd` output programmatically.
-- Follow the repository's `AGENTS.md` when its workflow differs from the generic Beads defaults.
+- If hooks are installed, `bd prime` may already be injected. Run it manually when context is missing.
 - Do not auto-close or mutate tasks unless the work is actually complete.
