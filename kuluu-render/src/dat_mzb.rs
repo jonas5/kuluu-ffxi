@@ -142,6 +142,18 @@ impl Default for DrawDistance {
 #[derive(Resource, Default, Debug, Clone, Copy)]
 pub struct StreamingAnchor(pub Option<Vec3>);
 
+pub(crate) fn diag_rss_mb() -> u64 {
+    std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1).and_then(|kb| kb.parse().ok()))
+        })
+        .map(|kb: u64| kb / 1024)
+        .unwrap_or(0)
+}
+
 #[derive(Component)]
 pub struct MzbCollisionMesh;
 
@@ -2290,6 +2302,16 @@ pub fn poll_load_mzb_tasks(
         if cache_eligible {
             cache.insert(key, geom.clone());
         }
+        if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+            info!(
+                "DIAG mzb spawn_begin: key {:?} reqs {} sub {} inst {} rss_mb {}",
+                key,
+                reqs.len(),
+                geom.submeshes.len(),
+                geom.instances.len(),
+                diag_rss_mb()
+            );
+        }
         for req in reqs {
             spawn_mzb_overlay(
                 req,
@@ -2306,6 +2328,13 @@ pub fn poll_load_mzb_tasks(
                 &mut activation,
                 init_vis,
                 false,
+            );
+        }
+        if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+            info!(
+                "DIAG mzb spawn_done: key {:?} rss_mb {}",
+                key,
+                diag_rss_mb()
             );
         }
     }
@@ -2671,6 +2700,21 @@ fn spawn_mzb_overlay(
     let mut noncollision_indices: Vec<u32> = Vec::new();
     let mut noncollision_tri_mat: Vec<u8> = Vec::new();
 
+    if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+        info!(
+            "DIAG mzb merge: file {} auto_loaded {} instances {} submeshes {} total_pos {} rss_mb {}",
+            req.file_id,
+            req.auto_loaded,
+            instances.len(),
+            submeshes.len(),
+            instances
+                .iter()
+                .map(|i| submeshes[i.submesh_idx].positions.len())
+                .sum::<usize>(),
+            diag_rss_mb()
+        );
+    }
+
     for inst in instances.iter() {
         let sub = &submeshes[inst.submesh_idx];
         let blocks_los = sub.flags & 1 == 0;
@@ -2712,6 +2756,21 @@ fn spawn_mzb_overlay(
                         meshes: &mut ResMut<Assets<Mesh>>| {
         if positions.is_empty() || indices.is_empty() {
             return;
+        }
+        if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+            info!(
+                "DIAG mzb merged mesh: {} {} positions {} indices {} bytes {} rss_mb {}",
+                if is_collision {
+                    "collision"
+                } else {
+                    "noncollision"
+                },
+                if auto_loaded { "auto" } else { "manual" },
+                positions.len(),
+                indices.len(),
+                positions.len() * 12 + indices.len() * 4,
+                diag_rss_mb()
+            );
         }
 
         let mut vert_mat: Vec<u8> = vec![0u8; positions.len()];
@@ -3059,6 +3118,7 @@ pub fn auto_load_zone_geometry_system(
     mmb_handle_cache.mesh.clear();
     mmb_handle_cache.material.clear();
     mmb_tex_pools.by_file.clear();
+    crate::dat_mmb::clear_mmb_file_textures();
     // Drop any old-zone water footprints still queued for streaming; the spawned
     // ones go with the despawned AutoMzbOverlay parent above.
     pending_water.specs.clear();

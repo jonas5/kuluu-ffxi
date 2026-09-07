@@ -1,6 +1,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::fs;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use bevy::asset::RenderAssetUsages;
 use bevy::image::Image;
@@ -12,6 +13,7 @@ use ffxi_dat::mmb::{parse_models, MmbHeader};
 use ffxi_dat::texture::{decode_texture, DecodedTexture};
 use ffxi_dat::{mmb, walk, ChunkKind, DatRoot};
 
+use crate::dat_mzb::diag_rss_mb;
 use crate::ffxi_zone_material::FfxiZoneMaterial;
 use crate::graphics_settings::GraphicsSettings;
 use crate::look_resolver::dispatch_look_driven_models;
@@ -285,13 +287,39 @@ pub struct NamedTexture {
 
 pub struct LoadedMmb {
     pub submeshes: Vec<MmbSubMesh>,
-    pub textures: Vec<NamedTexture>,
+    pub textures: Arc<Vec<NamedTexture>>,
 
     pub asset_name: String,
 
     /// Header bytes 16..32 (XIM's section `name`). A leading '_' selects the
     /// alpha-tested cutout render mode for this model's submeshes.
     pub zone_mesh_name: String,
+}
+
+/// Decoded-once-per-file MMB texture sets, shared by every chunk parse of the
+/// same DAT. An MMB chunk parse (`load_mmb`) walks the whole file's `Img`
+/// section, so without sharing a resident radius of K chunks holds K copies of
+/// the same texture set — the dominant term in zone-geometry RSS (a city-block
+/// file decodes ~120MB, so 80 resident chunks pinned ~9.5GB even though the
+/// geometry itself was a few MB). The first parse of a file pays the decode;
+/// the rest clone the `Arc`. Dropped when the last chunk of the file retires
+/// or the zone changes.
+static MMB_FILE_TEXTURES: OnceLock<Mutex<std::collections::HashMap<u32, Arc<Vec<NamedTexture>>>>> =
+    OnceLock::new();
+
+fn mmb_file_textures_bank() -> &'static Mutex<std::collections::HashMap<u32, Arc<Vec<NamedTexture>>>>
+{
+    MMB_FILE_TEXTURES.get_or_init(<_>::default)
+}
+
+/// Drop a whole file's shared texture set (last chunk retired / zone changed).
+pub fn drop_mmb_file_textures(file_id: u32) {
+    mmb_file_textures_bank().lock().unwrap().remove(&file_id);
+}
+
+/// Drop every file's shared texture set (zone changed).
+pub fn clear_mmb_file_textures() {
+    mmb_file_textures_bank().lock().unwrap().clear();
 }
 
 pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
@@ -323,15 +351,24 @@ pub fn load_mmb(file_id: u32, chunk_idx: usize) -> Result<LoadedMmb, String> {
 
     let models = parse_models(&decrypted);
 
-    let textures: Vec<NamedTexture> = chunks
-        .iter()
-        .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Img))
-        .filter_map(|c| {
-            let texture = decode_texture(c.data).ok()?;
-            let name = ffxi_dat::texture::extract_texture_name(c.data).unwrap_or_default();
-            Some(NamedTexture { name, texture })
-        })
-        .collect();
+    let textures: Arc<Vec<NamedTexture>> = {
+        let mut bank = mmb_file_textures_bank().lock().unwrap();
+        bank.entry(file_id)
+            .or_insert_with(|| {
+                let set: Vec<NamedTexture> = chunks
+                    .iter()
+                    .filter(|c| ChunkKind::from_u8(c.kind) == Some(ChunkKind::Img))
+                    .filter_map(|c| {
+                        let texture = decode_texture(c.data).ok()?;
+                        let name =
+                            ffxi_dat::texture::extract_texture_name(c.data).unwrap_or_default();
+                        Some(NamedTexture { name, texture })
+                    })
+                    .collect();
+                Arc::new(set)
+            })
+            .clone()
+    };
 
     let mut out = Vec::with_capacity(models.len());
     for m in &models {
@@ -443,6 +480,34 @@ pub fn process_load_mmb_requests(
     for (asset, result) in newly_parsed {
         parse_cache.by_asset.entry(asset).or_insert(result);
     }
+    if std::env::var("FFXI_DIAG_STREAM").is_ok() && parse_completed {
+        let mut sum = 0usize;
+        for l in parse_cache.by_asset.values().flatten() {
+            for s in &l.submeshes {
+                sum += s.positions.len() * 12
+                    + s.normals.len() * 12
+                    + s.uvs.len() * 8
+                    + s.indices.len() * 4;
+            }
+        }
+        let (unique_tex, bank_files) = {
+            let bank = mmb_file_textures_bank().lock().unwrap();
+            (
+                bank.values()
+                    .map(|v| v.iter().map(|t| t.texture.rgba.len()).sum::<usize>())
+                    .sum::<usize>(),
+                bank.len(),
+            )
+        };
+        info!(
+            "DIAG mmb cache: n {} geo MB {:.1} shared_tex MB {:.1} (bank files {}) rss_mb {}",
+            parse_cache.by_asset.len(),
+            sum as f64 / 1_048_576.0,
+            unique_tex as f64 / 1_048_576.0,
+            bank_files,
+            diag_rss_mb()
+        );
+    }
 
     let pending_before = queue.pending.len();
     queue.pending.extend(events.read().copied());
@@ -456,6 +521,18 @@ pub fn process_load_mmb_requests(
         .ok()
         .map(|t| t.translation())
         .or(stream_anchor.0);
+    if std::env::var("FFXI_DIAG_STREAM").is_ok()
+        && !queue
+            .last_eval_pos
+            .is_some_and(|l| self_pos.is_some_and(|s| l.distance_squared(s) < 1.0))
+    {
+        info!(
+            "DIAG mmb pass: self_pos {:?} pending {} rss_mb {}",
+            self_pos,
+            queue.pending.len(),
+            diag_rss_mb()
+        );
+    }
     if !mmb_repass_needed(
         new_events,
         parse_completed,
@@ -558,14 +635,38 @@ pub fn process_load_mmb_requests(
                     let mut by_name: std::collections::HashMap<String, Handle<Image>> =
                         std::collections::HashMap::with_capacity(texture_count);
                     let mut first: Option<Handle<Image>> = None;
-                    for nt in &loaded.textures {
-                        let handle = images.add(decoded_texture_to_image(&nt.texture, quality));
+                    let mut tex_bytes = 0usize;
+                    let mut tex_px = 0usize;
+                    for (i, nt) in loaded.textures.iter().enumerate() {
+                        let img = decoded_texture_to_image(&nt.texture, quality);
+                        tex_bytes += img.data.as_ref().map(|d| d.len()).unwrap_or(0);
+                        tex_px += (nt.texture.width as usize) * (nt.texture.height as usize);
+                        let handle = images.add(img);
+                        if std::env::var("FFXI_DIAG_STREAM").is_ok() && i.is_multiple_of(5) {
+                            info!(
+                                "DIAG mmb tex [{i}/{}] {}x{} rss_mb {}",
+                                loaded.textures.len(),
+                                nt.texture.width,
+                                nt.texture.height,
+                                diag_rss_mb()
+                            );
+                        }
                         if first.is_none() {
                             first = Some(handle.clone());
                         }
                         if !nt.name.is_empty() {
                             by_name.insert(nt.name.clone(), handle);
                         }
+                    }
+                    if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+                        info!(
+                            "DIAG mmb texpool: fid {} n {} px {} bytes MB {:.1} rss_mb {}",
+                            req.file_id,
+                            loaded.textures.len(),
+                            tex_px,
+                            tex_bytes as f64 / 1_048_576.0,
+                            diag_rss_mb()
+                        );
                     }
                     (by_name, first)
                 });
@@ -684,8 +785,17 @@ pub fn process_load_mmb_requests(
                 };
 
                 let n_subs = loaded.submeshes.len();
+                let mut plc_bytes = 0usize;
                 for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
                     let cache_key = (req.file_id, req.chunk_idx, sub_index);
+                    let is_new_mesh = !handle_cache.mesh.contains_key(&cache_key);
+                    if is_new_mesh {
+                        plc_bytes += sub.positions.len() * 12
+                            + sub.normals.len() * 12
+                            + sub.uvs.len() * 8
+                            + sub.colors.len() * 4
+                            + sub.indices.len() * 4;
+                    }
 
                     let mesh_handle = handle_cache
                         .mesh
@@ -838,6 +948,17 @@ pub fn process_load_mmb_requests(
                 }
 
                 let is_zone_spawn = req.entity_id.is_none() && req.world_transform.is_some();
+                if std::env::var("FFXI_DIAG_STREAM").is_ok() && is_zone_spawn {
+                    info!(
+                        "DIAG mmb plc: fid {} chunk {} subs {} new_bytes MB {:.1} rss_mb {} name {}",
+                        req.file_id,
+                        req.chunk_idx,
+                        n_subs,
+                        plc_bytes as f64 / 1_048_576.0,
+                        diag_rss_mb(),
+                        loaded.zone_mesh_name
+                    );
+                }
                 if !is_zone_spawn {
                     let where_ = match req.entity_id {
                         Some(id) => format!("on entity {id}"),
@@ -886,6 +1007,14 @@ pub fn process_load_mmb_requests(
         }
     }
     queue.pending = retained;
+
+    if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+        info!(
+            "DIAG mmb end: spawned {spawned} this pass, pending retained {} rss_mb {}",
+            queue.pending.len(),
+            diag_rss_mb()
+        );
+    }
 
     if diag_file_id.is_some() {
         for (fid, examples) in &diag_zero_submesh {
@@ -1029,6 +1158,7 @@ pub fn retire_far_zone_placements(
         in_flight.tasks.remove(&(req.file_id, req.chunk_idx));
         if !live_files.contains(&req.file_id) {
             tex_pools.drop_file(req.file_id);
+            drop_mmb_file_textures(req.file_id);
         }
     }
 }
@@ -1231,6 +1361,42 @@ mod tests {
         let near = mmb_load_order_key(&zone_placement_at(Vec3::new(5.0, 0.0, 0.0)), self_pos);
         let far = mmb_load_order_key(&zone_placement_at(Vec3::new(50.0, 0.0, 0.0)), self_pos);
         assert!(near < far);
+    }
+
+    #[test]
+    fn shared_file_texture_sets_are_deduplicated_and_dropped() {
+        use super::{drop_mmb_file_textures, mmb_file_textures_bank, NamedTexture};
+        use ffxi_dat::texture::DecodedTexture;
+        use std::sync::Arc;
+
+        let tex = |w, h| NamedTexture {
+            name: "t".to_string(),
+            texture: DecodedTexture {
+                width: w,
+                height: h,
+                format_tag: ffxi_dat::texture::TexFormat::Argb32,
+                rgba: vec![0u8; (w as usize) * (h as usize) * 4],
+            },
+        };
+
+        let bank = mmb_file_textures_bank();
+        let set = Arc::new(vec![tex(4, 4), tex(2, 2)]);
+        bank.lock().unwrap().insert(202, set.clone());
+
+        // A second parse of the same DAT must observe the same shared set; two
+        // chunks must never each decode (and own) the file's Img section.
+        {
+            let mut b = bank.lock().unwrap();
+            let first = b.get(&202).cloned().unwrap();
+            let again = b.entry(202).or_insert_with(|| Arc::new(Vec::new())).clone();
+            assert!(Arc::ptr_eq(&first, &again));
+        }
+
+        drop_mmb_file_textures(202);
+        assert!(
+            !bank.lock().unwrap().contains_key(&202),
+            "the whole file's texture set must drop when its last chunk retires"
+        );
     }
 
     #[test]
