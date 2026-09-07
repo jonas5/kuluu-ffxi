@@ -21,6 +21,14 @@ use crate::zone_texture::{decoded_texture_to_image, TextureQuality};
 #[derive(Component)]
 pub struct MmbOverlay;
 
+/// The original [`LoadMmbRequest`] that spawned a zone placement, stamped on the
+/// placement's parent so the distance-retirement pass can re-queue it (the
+/// request is `Copy` — this is the ~100B per placement cost of restartable
+/// streaming). Entity-attached models are excluded: they are few and small and
+/// follow their tracked entity instead of the streaming radius.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct ZonePlacementRef(pub LoadMmbRequest);
+
 #[derive(Resource, Default)]
 pub struct MmbHandleCache {
     pub mesh: std::collections::HashMap<(u32, usize, usize), bevy::asset::Handle<Mesh>>,
@@ -93,6 +101,32 @@ pub struct MmbTexPools {
 #[derive(Resource, Default)]
 pub struct AppliedTextureFiltering {
     pub anisotropy: Option<u16>,
+}
+
+impl MmbParseCache {
+    /// Drop parse state for one chunk, once every placement of it has retired.
+    pub fn drop_chunk(&mut self, file_id: u32, chunk_idx: usize) {
+        self.by_asset.remove(&(file_id, chunk_idx));
+    }
+}
+
+impl MmbHandleCache {
+    /// Drop mesh/material handles for one chunk (matched like the keys).
+    /// Releases the strong clones that pin the Bevy assets; `track_assets`
+    /// frees them once the entities referencing them despawn too.
+    pub fn drop_chunk(&mut self, file_id: u32, chunk_idx: usize) {
+        self.mesh
+            .retain(|(f, c, _), _| *f != file_id || *c != chunk_idx);
+        self.material
+            .retain(|(f, c, _, _), _| *f != file_id || *c != chunk_idx);
+    }
+}
+
+impl MmbTexPools {
+    /// Drop pooled texture handles for a whole DAT file.
+    pub fn drop_file(&mut self, file_id: u32) {
+        self.by_file.remove(&file_id);
+    }
 }
 
 // A generator-driven water sheet (ffxi-dat Generator::parse_model_spawn): the
@@ -207,6 +241,7 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::poll_load_mzb_tasks,
                     crate::dat_mzb::spawn_zone_water,
                     process_load_mmb_requests,
+                    retire_far_zone_placements,
                     crate::ffxi_actor_render::kick_load_actor_tasks,
                     crate::ffxi_actor_render::poll_load_actor_tasks,
                     crate::ffxi_actor_render::tick_morph_in,
@@ -632,6 +667,7 @@ pub fn process_load_mmb_requests(
                             e.insert((
                                 crate::dat_mzb::AutoMzbOverlay,
                                 crate::dat_mzb::ZoneBlockSlot(req.slot),
+                                ZonePlacementRef(req),
                             ));
                             if req.sub_area_link != 0 {
                                 e.insert(crate::dat_mzb::ZoneSubAreaLink(req.sub_area_link));
@@ -890,6 +926,113 @@ pub fn process_load_mmb_requests(
     }
 }
 
+/// How far past the spawn radius a placement must be before it is retired,
+/// so a placement spawned at the radius edge is not despawned by trivial
+/// boundary jitter; the extra margin is the hysteresis gap between
+/// `process_load_mmb_requests` (spawn at `load_radius`) and retirement.
+const RETIRE_MARGIN: f32 = 1.5;
+
+/// Whether a main-slot zone placement at `pos` is beyond the retirement radius
+/// for a streaming center at `center`: `RETIRE_MARGIN * load_radius`, measured
+/// on the XZ plane like the spawn ordering (`mmb_dist_sq_xz`).
+fn zone_placement_should_retire(center: Vec3, pos: Vec3, load_radius: f32) -> bool {
+    let retire_r2 = (load_radius * RETIRE_MARGIN).powi(2);
+    let d2 = (pos.x - center.x).powi(2) + (pos.z - center.z).powi(2);
+    d2 > retire_r2
+}
+
+/// Retire zone-model placements that have fallen far outside the streaming
+/// radius, so resident geometry stays bounded to the band around the player /
+/// backdrop flight camera instead of accumulating across a whole zone visit.
+///
+/// Despawned parents re-queue their original [`LoadMmbRequest`] on the pending
+/// stream (sorted far-last, re-spawned when the center approaches again). Once
+/// a `(file_id, chunk_idx)` has no surviving placement, its parse, mesh and
+/// material caches are dropped too — releasing the decoded submesh/texture
+/// arrays immediately and the Bevy Mesh/Image/Material once `track_assets`
+/// observes the handle count reaching zero. The camera's movement gates the
+/// scan (same `MMB_REEVAL_MOVE_YALMS` deadband as the spawn repass); a static
+/// center changes nothing worth re-evaluating.
+pub fn retire_far_zone_placements(
+    mut commands: Commands,
+    settings: Res<GraphicsSettings>,
+    self_q: Query<&GlobalTransform, With<crate::components::IsSelf>>,
+    stream_anchor: Res<crate::dat_mzb::StreamingAnchor>,
+    mut queue: ResMut<MmbLoadQueue>,
+    mut parse_cache: ResMut<MmbParseCache>,
+    mut handle_cache: ResMut<MmbHandleCache>,
+    mut tex_pools: ResMut<MmbTexPools>,
+    mut in_flight: ResMut<MmbLoadInFlight>,
+    mut last_center: Local<Option<Vec3>>,
+    placements_q: Query<
+        (
+            Entity,
+            &GlobalTransform,
+            &ZonePlacementRef,
+            &crate::dat_mzb::ZoneBlockSlot,
+        ),
+        With<crate::dat_mzb::AutoMzbOverlay>,
+    >,
+) {
+    let Some(center) = self_q
+        .single()
+        .ok()
+        .map(|t| t.translation())
+        .or(stream_anchor.0)
+    else {
+        return;
+    };
+    let deadband = MMB_REEVAL_MOVE_YALMS * MMB_REEVAL_MOVE_YALMS;
+    if last_center
+        .is_some_and(|prev| prev.distance_squared(center) <= deadband && !settings.is_changed())
+    {
+        return;
+    }
+    *last_center = Some(center);
+
+    let load_radius = settings.view_distance * crate::dat_mzb::MMB_LOAD_DISTANCE_MARGIN;
+
+    let mut to_retire: Vec<(Entity, LoadMmbRequest)> = Vec::new();
+    let mut live_chunks: std::collections::HashSet<(u32, usize)> = Default::default();
+    for (e, t, placement, slot) in placements_q.iter() {
+        if slot.0 == crate::dat_mzb::ZONE_SLOT_MAIN
+            && zone_placement_should_retire(center, t.translation(), load_radius)
+        {
+            to_retire.push((e, placement.0));
+            continue;
+        }
+        live_chunks.insert((placement.0.file_id, placement.0.chunk_idx));
+    }
+    if to_retire.is_empty() {
+        return;
+    }
+
+    for (e, req) in &to_retire {
+        queue.pending.push_back(*req);
+        if let Ok(mut ec) = commands.get_entity(*e) {
+            ec.try_despawn();
+        }
+    }
+
+    // A chunk is only dropped once every placement of it has retired; files are
+    // further kept while any other chunk of theirs still streams or resides.
+    let mut live_files: std::collections::HashSet<u32> = Default::default();
+    for (file_id, _) in &live_chunks {
+        live_files.insert(*file_id);
+    }
+    for (_, req) in &to_retire {
+        if live_chunks.contains(&(req.file_id, req.chunk_idx)) {
+            continue;
+        }
+        parse_cache.drop_chunk(req.file_id, req.chunk_idx);
+        handle_cache.drop_chunk(req.file_id, req.chunk_idx);
+        in_flight.tasks.remove(&(req.file_id, req.chunk_idx));
+        if !live_files.contains(&req.file_id) {
+            tex_pools.drop_file(req.file_id);
+        }
+    }
+}
+
 /// Choose an MMB submesh's render mode, per XIM (`research/xim` ·
 /// `ZoneMeshSection.kt`). The model name (header bytes 16..32, our
 /// `zone_mesh_name`) starting with '_' selects an alpha-tested cutout at
@@ -962,12 +1105,51 @@ fn mesh_debug_bundle(
 #[cfg(test)]
 mod tests {
     use super::{
-        mmb_dist_sq_xz, mmb_load_order_key, mmb_repass_needed, submesh_alpha_mode, LoadMmbRequest,
-        MMB_REEVAL_MOVE_YALMS,
+        mmb_dist_sq_xz, mmb_load_order_key, mmb_repass_needed, submesh_alpha_mode,
+        zone_placement_should_retire, LoadMmbRequest, MMB_REEVAL_MOVE_YALMS,
     };
     use crate::zone_texture::ffxi_alpha_remap;
     use bevy::prelude::{AlphaMode, Mat4, Vec3};
     use ffxi_dat::mzb::NO_SUB_AREA_LINK;
+
+    #[test]
+    fn far_zone_placements_retire_beyond_the_hysteresis_margin() {
+        let center = Vec3::new(100.0, 0.0, 100.0);
+        let load_radius = 100.0;
+        // Inside the spawn radius — never a retirement candidate.
+        assert!(!zone_placement_should_retire(
+            center,
+            center + Vec3::new(80.0, 0.0, 0.0),
+            load_radius
+        ));
+        // At 1.3x the spawn radius a placement stays resident: it spawned this
+        // side of the radius and the 1.5x margin keeps the ring inside it from
+        // being churned by boundary jitter (the hysteresis gap).
+        assert!(!zone_placement_should_retire(
+            center,
+            center + Vec3::new(130.0, 0.0, 0.0),
+            load_radius
+        ));
+        // Beyond the 1.5x margin it is retired.
+        assert!(zone_placement_should_retire(
+            center,
+            center + Vec3::new(200.0, 0.0, 0.0),
+            load_radius
+        ));
+        // Owner-side teleport: the placement that spawned within the radius but
+        // is now far side of the margin retires.
+        assert!(zone_placement_should_retire(
+            center,
+            center + Vec3::new(-200.0, 999.0, 0.0),
+            load_radius
+        ));
+        // Y is ignored: a high-but-close structure over the center stays.
+        assert!(!zone_placement_should_retire(
+            center,
+            center + Vec3::new(0.0, 5000.0, 0.0),
+            load_radius
+        ));
+    }
 
     #[test]
     fn repass_triggers_on_events_parses_budget_or_settings() {

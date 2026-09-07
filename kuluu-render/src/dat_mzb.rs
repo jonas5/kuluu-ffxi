@@ -3015,6 +3015,9 @@ pub fn auto_load_zone_geometry_system(
     mut mzb_in_flight: ResMut<LoadMzbInFlight>,
     mut mmb_queue: ResMut<crate::dat_mmb::MmbLoadQueue>,
     mut mmb_in_flight: ResMut<crate::dat_mmb::MmbLoadInFlight>,
+    mut mmb_parse_cache: ResMut<crate::dat_mmb::MmbParseCache>,
+    mut mmb_handle_cache: ResMut<crate::dat_mmb::MmbHandleCache>,
+    mut mmb_tex_pools: ResMut<crate::dat_mmb::MmbTexPools>,
     mut pending_water: ResMut<PendingWaterSpawns>,
     mut collision_geometry: ResMut<MzbCollisionGeometry>,
     mut area_map: ResMut<ZoneAreaMap>,
@@ -3048,6 +3051,14 @@ pub fn auto_load_zone_geometry_system(
         .pending
         .retain(|r| !(r.entity_id.is_none() && r.world_transform.is_some()));
     mmb_in_flight.tasks.clear();
+    // The old zone's placements all despawned above, so its parse, handle and
+    // texture caches are now the only things pinning its decoded submeshes and
+    // Bevy assets; drop them so the warp frees the zone's memory instead of
+    // carrying it into the next. The new zone parses fresh regardless.
+    mmb_parse_cache.by_asset.clear();
+    mmb_handle_cache.mesh.clear();
+    mmb_handle_cache.material.clear();
+    mmb_tex_pools.by_file.clear();
     // Drop any old-zone water footprints still queued for streaming; the spawned
     // ones go with the despawned AutoMzbOverlay parent above.
     pending_water.specs.clear();

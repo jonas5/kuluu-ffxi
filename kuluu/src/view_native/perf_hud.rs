@@ -81,6 +81,11 @@ pub struct PerfMonitor {
     spike_churn: [u64; 6],
     summary_churn: [u64; 6],
 
+    prev_churn_removed: [u64; 2],
+    last_d_churn_removed: [u64; 2],
+    spike_churn_removed: [u64; 2],
+    summary_churn_removed: [u64; 2],
+
     log_cooldown_s: f32,
     suppressed: u32,
 
@@ -140,6 +145,10 @@ impl Default for PerfMonitor {
             last_d_churn: [0; 6],
             spike_churn: [0; 6],
             summary_churn: [0; 6],
+            prev_churn_removed: [0; 2],
+            last_d_churn_removed: [0; 2],
+            spike_churn_removed: [0; 2],
+            summary_churn_removed: [0; 2],
             log_cooldown_s: 0.0,
             suppressed: 0,
             summary_s: 0.0,
@@ -161,6 +170,11 @@ pub struct AssetChurn {
     std_mats: u64,
     zone_mats: u64,
     skinned_mats: u64,
+    /// Images/meshes freed by `track_assets` after their last handle dropped —
+    /// the eviction side of `+` counts above, so the controller's effectiveness
+    /// is observable from a single line.
+    removed_images: u64,
+    removed_meshes: u64,
 }
 
 pub fn track_asset_churn(
@@ -175,17 +189,24 @@ pub fn track_asset_churn(
     images: Res<Assets<Image>>,
 ) {
     for ev in img_ev.read() {
-        if let AssetEvent::Added { id } | AssetEvent::Modified { id } = ev {
-            churn.images += 1;
-            if let Some(img) = images.get(*id) {
-                churn.image_bytes += img.data.as_ref().map_or(0, Vec::len) as u64;
+        match ev {
+            AssetEvent::Added { id } | AssetEvent::Modified { id } => {
+                churn.images += 1;
+                if let Some(img) = images.get(*id) {
+                    churn.image_bytes += img.data.as_ref().map_or(0, Vec::len) as u64;
+                }
             }
+            AssetEvent::Removed { .. } => churn.removed_images += 1,
+            _ => {}
         }
     }
-    churn.meshes += mesh_ev
-        .read()
-        .filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. }))
-        .count() as u64;
+    for ev in mesh_ev.read() {
+        if matches!(ev, AssetEvent::Added { .. } | AssetEvent::Modified { .. }) {
+            churn.meshes += 1;
+        } else if matches!(ev, AssetEvent::Removed { .. }) {
+            churn.removed_meshes += 1;
+        }
+    }
     churn.std_mats += std_ev
         .read()
         .filter(|e| matches!(e, AssetEvent::Added { .. } | AssetEvent::Modified { .. }))
@@ -348,8 +369,19 @@ pub fn update_perf_monitor(
         w_churn[i] = d_churn[i] + m.last_d_churn[i];
         m.summary_churn[i] += d_churn[i];
     }
+
+    let churn_removed_now = [churn.removed_images, churn.removed_meshes];
+    let mut d_churn_removed = [0u64; 2];
+    let mut w_churn_removed = [0u64; 2];
+    for i in 0..2 {
+        d_churn_removed[i] = churn_removed_now[i].wrapping_sub(m.prev_churn_removed[i]);
+        w_churn_removed[i] = d_churn_removed[i] + m.last_d_churn_removed[i];
+        m.summary_churn_removed[i] += d_churn_removed[i];
+    }
     m.prev_churn = churn_now;
+    m.prev_churn_removed = churn_removed_now;
     m.last_d_churn = d_churn;
+    m.last_d_churn_removed = d_churn_removed;
 
     m.summary_s += dt;
     m.summary_frames += 1;
@@ -361,7 +393,7 @@ pub fn update_perf_monitor(
         let avg_fps = m.summary_frames as f32 / m.summary_s;
         info!(
             target: "perf",
-            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}\u{00b5}s {} rgraph {}\u{00b5}s rtotal {}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}",
+            "summary {avg_fps:.1}fps baseline {:.1}ms max {:.1}ms spikes {} | max rprep {}\u{00b5}s {} rgraph {}\u{00b5}s rtotal {}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{} | evict img+{} mesh+{}",
             m.baseline_ms,
             m.summary_max_ms,
             m.spikes_total,
@@ -375,6 +407,8 @@ pub fn update_perf_monitor(
             m.summary_churn[3],
             m.summary_churn[4],
             m.summary_churn[5],
+            m.summary_churn_removed[0],
+            m.summary_churn_removed[1],
         );
         m.summary_s = 0.0;
         m.summary_frames = 0;
@@ -384,6 +418,7 @@ pub fn update_perf_monitor(
         m.summary_max_rtotal_us = 0;
         m.summary_max_rspans_us = [0; 5];
         m.summary_churn = [0; 6];
+        m.summary_churn_removed = [0; 2];
     }
 
     // `Time` delta is sampled at frame start but the counters here are read mid-Update, so a
@@ -437,6 +472,7 @@ pub fn update_perf_monitor(
     m.spike_rtotal_us = w_rtotal_us;
     m.spike_rspans_us = w_rspans_us;
     m.spike_churn = w_churn;
+    m.spike_churn_removed = w_churn_removed;
     m.spike_cpu_us = cpu_us;
     m.spike_main_us = m.last_main_us;
     m.secs_since_spike = 0.0;
@@ -465,7 +501,7 @@ pub fn update_perf_monitor(
     let render_spans = top_render_spans(&diag);
     warn!(
         target: "perf",
-        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s [rprep {w_rprep_us}\u{00b5}s {} rgraph {w_rgraph_us}\u{00b5}s rtotal {w_rtotal_us}\u{00b5}s] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{}{extra}{render_spans}",
+        "frame spike {dt_ms:.1}ms (baseline {:.1}ms, +{:.1}ms) after {interval:.2}s \u{2014} cpu {}\u{00b5}s late {late_us}\u{00b5}s render~{render_us}\u{00b5}s [rprep {w_rprep_us}\u{00b5}s {} rgraph {w_rgraph_us}\u{00b5}s rtotal {w_rtotal_us}\u{00b5}s] | {rebuild}, model+{w_model} plate+{w_rasters} probe {w_probe_us}\u{00b5}s | churn img+{} ({}KB) mesh+{} std+{} zone+{} skin+{} | evict img+{} mesh+{}{extra}{render_spans}",
         m.baseline_ms,
         dt_ms - m.baseline_ms,
         cpu_us,
@@ -476,6 +512,8 @@ pub fn update_perf_monitor(
         m.spike_churn[3],
         m.spike_churn[4],
         m.spike_churn[5],
+        m.spike_churn_removed[0],
+        m.spike_churn_removed[1],
     );
 }
 
