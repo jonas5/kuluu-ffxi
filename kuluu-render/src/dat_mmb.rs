@@ -188,6 +188,7 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<AppliedTextureFiltering>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<crate::dat_mzb::DrawDistance>()
+            .init_resource::<crate::dat_mzb::StreamingAnchor>()
             .init_resource::<crate::dat_mzb::MzbCollisionGeometry>()
             .init_resource::<crate::dat_mzb::ZoneAreaMap>()
             .init_resource::<crate::dat_mzb::ZoneChunkLightMap>()
@@ -390,6 +391,7 @@ pub fn process_load_mmb_requests(
     mut tex_pools_res: ResMut<MmbTexPools>,
     settings: Res<GraphicsSettings>,
     self_q: Query<&GlobalTransform, With<crate::components::IsSelf>>,
+    stream_anchor: Res<crate::dat_mzb::StreamingAnchor>,
     mut in_flight: ResMut<MmbLoadInFlight>,
 ) {
     let mut newly_parsed: Vec<((u32, usize), Option<LoadedMmb>)> = Vec::new();
@@ -414,7 +416,11 @@ pub fn process_load_mmb_requests(
         return;
     }
 
-    let self_pos = self_q.single().ok().map(|t| t.translation());
+    let self_pos = self_q
+        .single()
+        .ok()
+        .map(|t| t.translation())
+        .or(stream_anchor.0);
     if !mmb_repass_needed(
         new_events,
         parse_completed,

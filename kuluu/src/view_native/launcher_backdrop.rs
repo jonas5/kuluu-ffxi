@@ -1,5 +1,6 @@
 use bevy::camera::visibility::RenderLayers;
 use bevy::prelude::*;
+use kuluu_render::dat_mzb::StreamingAnchor;
 use kuluu_render::SceneState;
 use kuluu_session::lobby_client::CharSlot;
 
@@ -116,15 +117,18 @@ impl Plugin for LauncherBackdropPlugin {
             .init_resource::<PendingBackdropSwap>()
             .init_resource::<BackdropFade>()
             .init_resource::<BackdropFlight>()
+            .init_resource::<StreamingAnchor>()
             .insert_resource(ClearColor(Color::NONE))
             .add_systems(OnEnter(AppPhase::Launcher), spawn_backdrop_camera)
             .add_systems(OnExit(AppPhase::Launcher), despawn_backdrop_camera)
+            .add_systems(OnExit(AppPhase::Launcher), clear_stream_anchor)
             .add_systems(
                 Update,
                 (
                     update_backdrop_from_selection,
                     drive_backdrop_fade,
                     drive_backdrop_flight,
+                    sync_stream_anchor,
                     apply_overlay_alpha,
                     mirror_backdrop_to_scene_state,
                 )
@@ -138,7 +142,9 @@ fn spawn_backdrop_camera(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut stream_anchor: ResMut<StreamingAnchor>,
 ) {
+    let cam_t = Transform::from_xyz(0.0, 6.0, 12.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y);
     let cam = commands
         .spawn((
             BackdropCamera,
@@ -149,9 +155,10 @@ fn spawn_backdrop_camera(
                 ..default()
             },
             RenderLayers::layer(BACKDROP_RENDER_LAYER),
-            Transform::from_xyz(0.0, 6.0, 12.0).looking_at(Vec3::new(0.0, 2.0, 0.0), Vec3::Y),
+            cam_t,
         ))
         .id();
+    stream_anchor.0 = Some(cam_t.translation);
 
     let quad = meshes.add(Rectangle::new(40.0, 40.0));
     let mat = materials.add(StandardMaterial {
@@ -193,6 +200,10 @@ fn despawn_backdrop_camera(mut commands: Commands, q: Query<Entity, With<Backdro
     }
 
     commands.remove_resource::<BackdropFadeMaterial>();
+}
+
+fn clear_stream_anchor(mut stream_anchor: ResMut<StreamingAnchor>) {
+    stream_anchor.0 = None;
 }
 
 fn mirror_backdrop_to_scene_state(zone: Res<LauncherBackdropZone>, mut scene: ResMut<SceneState>) {
@@ -354,6 +365,19 @@ fn cut_segment(fade: &mut BackdropFade) {
             cut: FadeCut::Segment,
             elapsed: 0.0,
         };
+    }
+}
+
+// Feeds the backdrop camera position to the zone streaming cull as
+// [`kuluu_render::dat_mzb::StreamingAnchor`], so `process_load_mmb_requests`
+// and water spawns distance-gate against the flying camera instead of spawning
+// the whole zone (the launcher has no `IsSelf` entity in the ECS).
+fn sync_stream_anchor(
+    cams: Query<&Transform, With<BackdropCamera>>,
+    mut stream_anchor: ResMut<StreamingAnchor>,
+) {
+    if let Ok(cam) = cams.single() {
+        stream_anchor.0 = Some(cam.translation);
     }
 }
 

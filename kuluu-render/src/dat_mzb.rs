@@ -132,6 +132,16 @@ impl Default for DrawDistance {
     }
 }
 
+/// Fallback anchor for zone streaming when no [`IsSelf`] entity is alive.
+/// The launcher writes the backdrop flight camera position here every frame
+/// (see `kuluu/src/view_native/launcher_backdrop.rs`); otherwise the MMB and
+/// water streams would spawn the whole zone at once, because the distance sort
+/// and radius cull in `process_load_mmb_requests`/`spawn_zone_water` have no
+/// position to work from. In-game [`IsSelf`] always wins, so `Some` here is
+/// ignored whenever a player entity exists.
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct StreamingAnchor(pub Option<Vec3>);
+
 #[derive(Component)]
 pub struct MzbCollisionMesh;
 
@@ -2470,12 +2480,17 @@ pub fn spawn_zone_water(
     mut water_mat: ResMut<ZoneWaterMaterial>,
     settings: Res<crate::graphics::GraphicsSettings>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
+    stream_anchor: Res<StreamingAnchor>,
 ) {
     if pending.specs.is_empty() {
         return;
     }
 
-    let self_pos = self_q.single().ok().map(|t| t.translation());
+    let self_pos = self_q
+        .single()
+        .ok()
+        .map(|t| t.translation())
+        .or(stream_anchor.0);
     if let Some(self_pos) = self_pos {
         pending.specs.make_contiguous().sort_by(|a, b| {
             water_dist_sq_xz(a, self_pos).total_cmp(&water_dist_sq_xz(b, self_pos))
