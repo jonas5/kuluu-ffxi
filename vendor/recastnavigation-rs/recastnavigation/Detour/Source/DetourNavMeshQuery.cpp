@@ -84,17 +84,17 @@ float dtQueryFilter::getCost(const float* pa, const float* pb,
 	return dtVdist(pa, pb) * m_areaCost[curPoly->getArea()];
 }
 #else
-inline bool dtQueryFilter::passFilter(const dtPolyRef /*ref*/,
-									  const dtMeshTile* /*tile*/,
-									  const dtPoly* poly) const
+bool dtQueryFilter::passFilter(const dtPolyRef /*ref*/,
+							  const dtMeshTile* /*tile*/,
+							  const dtPoly* poly) const
 {
 	return (poly->flags & m_includeFlags) != 0 && (poly->flags & m_excludeFlags) == 0;
 }
 
-inline float dtQueryFilter::getCost(const float* pa, const float* pb,
-									const dtPolyRef /*prevRef*/, const dtMeshTile* /*prevTile*/, const dtPoly* /*prevPoly*/,
-									const dtPolyRef /*curRef*/, const dtMeshTile* /*curTile*/, const dtPoly* curPoly,
-									const dtPolyRef /*nextRef*/, const dtMeshTile* /*nextTile*/, const dtPoly* /*nextPoly*/) const
+float dtQueryFilter::getCost(const float* pa, const float* pb,
+							 const dtPolyRef /*prevRef*/, const dtMeshTile* /*prevTile*/, const dtPoly* /*prevPoly*/,
+							 const dtPolyRef /*curRef*/, const dtMeshTile* /*curTile*/, const dtPoly* curPoly,
+							 const dtPolyRef /*nextRef*/, const dtMeshTile* /*nextTile*/, const dtPoly* /*nextPoly*/) const
 {
 	return dtVdist(pa, pb) * m_areaCost[curPoly->getArea()];
 }
