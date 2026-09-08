@@ -6,12 +6,16 @@ use bevy::window::{PresentMode, PrimaryWindow};
 use kuluu_render::dat_mmb::LoadMmbRequest;
 use kuluu_render::dat_mzb::LoadMzbRequest;
 use kuluu_render::hud::chat_panel::{ActiveChatTab, ChatScroll};
+use kuluu_render::hud::macro_editor::MacroEditorState;
 use kuluu_render::{
     Action, Bindings, ChatBuffer, ChatHistory, DialogCursor, InputMode, MenuKind, MenuStack,
     Preset, QuickActionState, SceneState, Target,
 };
 
 use super::debug_heights::DebugHeightsRequest;
+
+use crate::macro_store::MacroBooks;
+use crate::view_native::text_input::macro_exec::MacroSequencer;
 
 mod check;
 pub use check::bazaar_mode_sync_system;
@@ -26,6 +30,11 @@ pub use delivery::delivery_mode_sync_system;
 use delivery::handle_delivery_key;
 
 mod map_screen;
+
+pub mod macro_exec;
+pub use macro_exec::macro_step_system;
+
+mod macro_editor;
 
 mod menu;
 use menu::{confirm_menu_at_cursor, handle_menu_key};
@@ -148,6 +157,15 @@ pub struct KeyEventStreams<'w, 's> {
 }
 
 #[derive(SystemParam)]
+pub struct MacroKeyState<'w> {
+    pub macro_books: ResMut<'w, MacroBooks>,
+    pub macro_sequencer: ResMut<'w, MacroSequencer>,
+    pub active_macro_page: ResMut<'w, kuluu_render::ActiveMacroPage>,
+    pub macro_editor_state: ResMut<'w, MacroEditorState>,
+    pub dynamic_menu: Res<'w, kuluu_render::hud::menu::DynamicMenu>,
+}
+
+#[derive(SystemParam)]
 pub struct MenuConfirmWriters<'w> {
     pub graphics: ResMut<'w, kuluu_render::GraphicsSettings>,
     pub status_profile_open: ResMut<'w, kuluu_render::hud::status_panel::StatusProfileOpen>,
@@ -190,7 +208,7 @@ pub(crate) fn text_input_system(
 
     mut chat_scroll: ResMut<ChatScroll>,
 
-    dynamic_menu: Res<kuluu_render::hud::menu::DynamicMenu>,
+    mut macro_state: MacroKeyState,
 ) {
     let entities = scene_state.snapshot.entities.clone();
     let self_pos = scene_state.snapshot.self_pos.pos;
@@ -335,13 +353,17 @@ pub(crate) fn text_input_system(
                     &mut slash_writers.sort_options,
                     &mut slash_writers.item_menu_focus,
                     &mut slash_writers.item_screen_container,
-                    &dynamic_menu,
+                    &macro_state.dynamic_menu,
                     current_target,
                     self_pos,
                     &mut slash_writers.map_screen_state,
                     slash_writers.map_markers.reborrow(),
                     &slash_writers.map_view,
                     &slash_writers.minimap_state,
+                    &mut macro_state.macro_editor_state,
+                    &mut macro_state.macro_books,
+                    &mut macro_state.macro_sequencer,
+                    &mut macro_state.active_macro_page,
                 ) {
                     *mode = next;
                 }
@@ -987,6 +1009,7 @@ fn sub_target_action_for(
         A::EquipItem { .. } => None,
         A::KeyItem { .. } => None,
         A::Emote { .. } => None,
+        A::Noop => None,
     }
 }
 
@@ -1415,6 +1438,7 @@ fn dispatch_dynamic_menu_action(
                 )
             }
         }
+        A::Noop => return,
     };
     if let Err(e) = cmd_tx.try_send(cmd) {
         push_system_chat_line(scene_state, format!("[menu] {kind_name} dropped: {e}"));
@@ -1913,6 +1937,7 @@ fn resolve_quick_action(
         "Magic" => QuickActionDispatch::OpenMenu(MenuKind::Magic),
         "Abilities" => QuickActionDispatch::OpenMenu(MenuKind::Abilities),
         "Items" => QuickActionDispatch::OpenMenu(MenuKind::Items),
+        "Macros" => QuickActionDispatch::OpenMenu(MenuKind::Macros),
 
         other => QuickActionDispatch::NotImplemented(other.to_string()),
     }
@@ -2197,8 +2222,8 @@ mod quick_action_tests {
     #[test]
     fn unwired_entry_stays_not_implemented() {
         let ent = target_ent(1, 1);
-        let result = resolve_quick_action("Macros", Some(&ent));
-        assert_eq!(result, QuickActionDispatch::NotImplemented("Macros".into()),);
+        let result = resolve_quick_action("Party", Some(&ent));
+        assert_eq!(result, QuickActionDispatch::NotImplemented("Party".into()));
     }
 
     #[test]
@@ -2207,6 +2232,7 @@ mod quick_action_tests {
             ("Magic", MenuKind::Magic),
             ("Abilities", MenuKind::Abilities),
             ("Items", MenuKind::Items),
+            ("Macros", MenuKind::Macros),
         ] {
             let result = resolve_quick_action(label, None);
             assert_eq!(

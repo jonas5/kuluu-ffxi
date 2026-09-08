@@ -251,6 +251,18 @@ pub enum MenuKind {
     /// `hud::map_screen::MapScreenState`, so the generic menu is suppressed while
     /// it is on top.
     Map,
+
+    /// Macro palette root: 40 macro books.
+    Macros,
+
+    /// Page-10 list inside one macro book.
+    MacroBook(usize),
+
+    /// Bespoke editor for a single macro page (20 slots, 6 lines each).
+    MacroPage {
+        book: usize,
+        page: usize,
+    },
 }
 
 #[derive(Debug, Clone)]

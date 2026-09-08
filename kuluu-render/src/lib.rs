@@ -111,6 +111,7 @@ pub use graphics_settings::{
     AaMode, CharacterRenderPath, DlssQuality, DynamicLights, GraphicsField, GraphicsSettings,
     QualityPreset, TextureFiltering, ZoneLineDisplay, DLSS_CONFIG_FIELDS, GRAPHICS_FIELDS,
 };
+pub use hud::macros::{ActiveMacroPage, Macro, MacroBook, MacroPage};
 pub use hud::{add_hud_spawners, HudPlugin};
 pub use input_mode::{
     ChatBuffer, ChatHistory, DialogCursor, InputMode, MenuKind, MenuLevel, MenuStack,

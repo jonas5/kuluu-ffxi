@@ -11,6 +11,8 @@ pub mod graphics_store;
 #[cfg(feature = "native-window")]
 pub mod keybinds_store;
 #[cfg(feature = "native-window")]
+pub mod macro_store;
+#[cfg(feature = "native-window")]
 pub mod marker_store;
 #[cfg(feature = "native-window")]
 pub mod overlay_store;

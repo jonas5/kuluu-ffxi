@@ -70,7 +70,7 @@ run_style() {
   local bad=()
   for f in "$hud_dir"/*.rs; do
     [[ "$(basename "$f")" == "style.rs" ]] && continue
-    if grep -Eq 'hud::palette|palette::|mod palette' "$f"; then
+    if grep -Eq 'hud::palette|\bpalette::|mod palette' "$f"; then
       bad+=("$f")
     fi
   done

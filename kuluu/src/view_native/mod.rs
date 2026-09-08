@@ -9,6 +9,8 @@ pub mod input;
 pub mod key_drive;
 pub mod key_items;
 pub mod launcher_backdrop;
+pub mod macro_editor;
+pub mod macro_palette;
 // 0.19 deprecated the feathers `*_bundle` spawn fns in favor of BSN scenes;
 // the launcher screens migrate to BSN in kuluu-dnr5, so tolerate the shims
 // until then.
@@ -689,6 +691,28 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.init_resource::<input::SelectTargetMode>();
     app.init_resource::<key_items::KeyItemsViewed>();
 
+    let (macro_books, macro_store) = crate::macro_store::load_or_default();
+    app.insert_resource(crate::macro_store::MacroBooks { map: macro_books });
+    app.insert_resource(crate::macro_store::MacroStoreRes { store: macro_store });
+    app.init_resource::<text_input::macro_exec::MacroSequencer>();
+    app.add_systems(
+        Update,
+        (
+            macro_palette::macro_palette_provider_system,
+            macro_editor::macro_editor_provider_system,
+        )
+            .run_if(in_state(AppPhase::InGame)),
+    );
+    app.add_systems(
+        Update,
+        (
+            text_input::macro_exec::macro_hotkey_system,
+            text_input::macro_step_system,
+        )
+            .chain()
+            .run_if(in_state(AppPhase::InGame)),
+    );
+
     app.insert_resource(crate::padbinds_store::load_or_default());
     app.init_resource::<gamepad_input::PrimaryGamepad>();
     app.init_resource::<gamepad_input::PadStickIntent>();
@@ -767,6 +791,10 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     app.add_systems(Update, crate::graphics_store::persist_graphics_on_change);
     app.add_systems(Update, crate::audio_store::persist_audio_on_change);
     app.add_systems(Update, crate::marker_store::sync_markers);
+    app.add_systems(
+        Update,
+        crate::macro_store::persist_macros_on_change.run_if(in_state(AppPhase::InGame)),
+    );
 
     app.add_systems(
         PostUpdate,

@@ -21,6 +21,9 @@ pub mod item_meta;
 pub mod item_screen;
 pub mod item_ui;
 pub mod logout_countdown;
+pub mod macro_editor;
+pub mod macro_palette;
+pub mod macros;
 // Depends on `crate::minimap`, which is itself gated off wasm (lib.rs).
 pub mod graphics_debug;
 #[cfg(not(target_arch = "wasm32"))]
@@ -214,6 +217,10 @@ impl Plugin for HudPlugin {
         app.init_resource::<vana_clock::VanaClockVisible>();
 
         app.init_resource::<menu::DynamicMenu>();
+        app.init_resource::<macros::ActiveMacroPage>();
+        app.init_resource::<macro_palette::MacroPaletteData>();
+        app.init_resource::<macro_editor::MacroEditorState>();
+        app.init_resource::<macro_editor::MacroEditorData>();
 
         app.init_resource::<overlay::ActiveOverlay>();
         app.init_resource::<chat_panel::ActiveChatTab>();
@@ -350,6 +357,8 @@ impl Plugin for HudPlugin {
 
         app.add_systems(Update, logout_countdown::update_logout_countdown);
         app.add_systems(Update, treasure_pool::update_treasure_pool);
+        app.add_systems(Update, macro_palette::update_macro_palette);
+        app.add_systems(Update, macro_editor::update_macro_editor);
 
         app.add_systems(
             Update,
@@ -494,6 +503,8 @@ pub fn add_hud_spawners<L: bevy::ecs::schedule::ScheduleLabel + Clone>(app: &mut
     app.add_systems(schedule.clone(), stair_debug::spawn_stair_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_graphics_debug_hud);
     app.add_systems(schedule.clone(), graphics_debug::spawn_nameplate_debug_hud);
+    app.add_systems(schedule.clone(), macro_palette::spawn_macro_palette);
+    app.add_systems(schedule.clone(), macro_editor::spawn_macro_editor);
 
     #[cfg(feature = "enhanced-buff-tooltips")]
     app.add_systems(schedule.clone(), status_ribbon::tooltip::spawn_buff_tooltip);

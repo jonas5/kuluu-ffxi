@@ -843,6 +843,11 @@ pub(super) fn apply_slash_outcome(
                 }
                 kuluu_render::MenuKind::EquipSlot(slot) => format!("EquipSlot({slot})").into(),
                 kuluu_render::MenuKind::Map => "Map".into(),
+                kuluu_render::MenuKind::Macros => "Macros".into(),
+                kuluu_render::MenuKind::MacroBook(book) => format!("MacroBook({book})").into(),
+                kuluu_render::MenuKind::MacroPage { book, page } => {
+                    format!("MacroPage({book}/{page})").into()
+                }
             };
             push_system_chat_line(scene_state, format!("[menu] opened {label}"));
         }

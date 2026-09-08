@@ -162,6 +162,9 @@ pub enum DynamicMenuAction {
     Emote {
         emote_id: u8,
     },
+
+    /// Navigation-only row (book/page selection) that has no direct action.
+    Noop,
 }
 
 impl DynamicMenuAction {
@@ -497,6 +500,8 @@ pub fn is_dynamic(kind: MenuKind) -> bool {
             | MenuKind::ItemAction { .. }
             | MenuKind::EquipSlot(_)
             | MenuKind::EmoteList
+            | MenuKind::Macros
+            | MenuKind::MacroBook(_)
     )
 }
 
@@ -624,6 +629,9 @@ fn static_entries(kind: MenuKind) -> &'static [&'static str] {
         MenuKind::GraphicsDlss => GRAPHICS_DLSS_ENTRIES,
         // The Map screen renders its own bespoke panes; it has no generic list.
         MenuKind::Map => &[],
+
+        // Macro pages render a bespoke editor; the book/page lists are dynamic.
+        MenuKind::Macros | MenuKind::MacroBook(_) | MenuKind::MacroPage { .. } => &[],
     }
 }
 
@@ -646,6 +654,9 @@ pub fn menu_title(kind: MenuKind) -> &'static str {
         MenuKind::EmoteList => "Emote List",
         MenuKind::GraphicsDlss => "DLSS Config",
         MenuKind::Map => "Map",
+        MenuKind::Macros => "Macros",
+        MenuKind::MacroBook(_) => "Macros",
+        MenuKind::MacroPage { .. } => "Macros",
     }
 }
 
@@ -668,6 +679,7 @@ pub fn root_child_kind(label: &str) -> Option<MenuKind> {
         "Graphics" => MenuKind::Graphics,
         "Config" => MenuKind::Config,
         "Debug" => MenuKind::Debug,
+        "Macros" => MenuKind::Macros,
         _ => return None,
     })
 }
@@ -683,6 +695,7 @@ pub fn renders_bespoke_screen(kind: MenuKind) -> bool {
             | MenuKind::Items
             | MenuKind::UsableItems
             | MenuKind::Map
+            | MenuKind::MacroPage { .. }
     )
 }
 
@@ -897,6 +910,18 @@ pub fn refresh_dynamic_menu_rows(
                 })
                 .collect()
         }
+        MenuKind::Macros => (0..crate::hud::macros::MACRO_BOOKS)
+            .map(|i| DynamicMenuRow {
+                label: crate::hud::macros::default_book_name(i),
+                action: DynamicMenuAction::Noop,
+            })
+            .collect(),
+        MenuKind::MacroBook(_) => (0..crate::hud::macros::MACRO_PAGES)
+            .map(|i| DynamicMenuRow {
+                label: crate::hud::macros::default_page_name(i),
+                action: DynamicMenuAction::Noop,
+            })
+            .collect(),
         _ => Vec::new(),
     };
 

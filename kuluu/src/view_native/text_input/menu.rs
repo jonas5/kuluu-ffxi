@@ -2,11 +2,23 @@ use super::map_screen::handle_map_key;
 use super::slash_apply::apply_keybind_update;
 use super::*;
 
+use crate::macro_store::MacroBooks;
+use crate::view_native::text_input::macro_exec::MacroSequencer;
+use kuluu_render::hud::macro_editor::MacroEditorState;
+use kuluu_render::ActiveMacroPage;
+
 #[derive(Debug, Clone, PartialEq)]
 enum MenuDispatch {
-    CommandWithToast { cmd: AgentCommand, toast: String },
+    CommandWithToast {
+        cmd: AgentCommand,
+        toast: String,
+    },
 
     OpenSubmenu(MenuKind),
+
+    /// Macro list rows navigate locally (book index = cursor, page index =
+    /// cursor) into the next screen; no dispatch reaches the session.
+    DrillMacroBook,
 
     KeybindUpdate(KeybindUpdate),
 
@@ -64,6 +76,8 @@ fn resolve_menu_entry(kind: MenuKind, label: &str) -> MenuDispatch {
         // The Map screen is a bespoke pane (no generic right-pane preview via
         // root_child_kind), so it needs its own drill arm ahead of the catch-all.
         (MenuKind::Root, "Map") => MenuDispatch::OpenSubmenu(MenuKind::Map),
+
+        (MenuKind::Macros, _) => MenuDispatch::DrillMacroBook,
 
         // Root categories that drill into a browsable submenu share their
         // mapping with the right-pane preview (single source of truth).
@@ -227,6 +241,11 @@ pub(super) fn confirm_menu_at_cursor(
         return None;
     }
 
+    if let MenuKind::MacroBook(book) = kind {
+        stack.push(MenuKind::MacroPage { book, page: cursor });
+        return None;
+    }
+
     if kuluu_render::hud::menu::is_dynamic(kind) {
         if let Some(action) = kuluu_render::hud::menu::entry_action(kind, cursor, dynamic) {
             use kuluu_render::hud::menu::DynamicMenuAction as A;
@@ -302,6 +321,10 @@ pub(super) fn confirm_menu_at_cursor(
                 push_system_chat_line(scene_state, toast);
             }
             Some(InputMode::World)
+        }
+        MenuDispatch::DrillMacroBook => {
+            stack.push(MenuKind::MacroBook(cursor));
+            None
         }
         MenuDispatch::OpenSubmenu(submenu) => {
             // Refresh the job-emote/chair unlock bits whenever the Emote List
@@ -549,6 +572,10 @@ pub(super) fn handle_menu_key(
     map_markers: Mut<kuluu_render::hud::map_screen::MapMarkers>,
     map_view: &kuluu_render::hud::map_screen::MapView,
     minimap_state: &kuluu_render::minimap::MinimapState,
+    macro_editor_state: &mut MacroEditorState,
+    macro_books: &mut MacroBooks,
+    macro_sequencer: &mut MacroSequencer,
+    active_macro_page: &mut ActiveMacroPage,
 ) -> Option<InputMode> {
     let top_kind = stack.current()?.kind;
 
@@ -575,6 +602,20 @@ pub(super) fn handle_menu_key(
             map_markers,
             map_view,
             minimap_state,
+        );
+    }
+    if let MenuKind::MacroPage { book, page } = top_kind {
+        return super::macro_editor::handle_macro_editor_key(
+            key,
+            bindings,
+            stack,
+            book,
+            page,
+            scene_state,
+            macro_editor_state,
+            macro_books,
+            macro_sequencer,
+            active_macro_page,
         );
     }
     let (kind, cursor) = {
@@ -845,6 +886,10 @@ mod menu_key_tests {
         map_state: MapScreenState,
         map_view: MapView,
         minimap_state: MinimapState,
+        macro_editor_state: MacroEditorState,
+        macro_books: MacroBooks,
+        macro_sequencer: MacroSequencer,
+        active_macro_page: ActiveMacroPage,
         cmd_tx: Sender<AgentCommand>,
         _cmd_rx: tokio::sync::mpsc::Receiver<AgentCommand>,
     }
@@ -875,6 +920,10 @@ mod menu_key_tests {
                 map_state: MapScreenState::default(),
                 map_view: MapView::default(),
                 minimap_state: MinimapState::default(),
+                macro_editor_state: MacroEditorState::default(),
+                macro_books: MacroBooks::default(),
+                macro_sequencer: MacroSequencer::default(),
+                active_macro_page: ActiveMacroPage::default(),
                 cmd_tx,
                 _cmd_rx,
             }
@@ -912,6 +961,10 @@ mod menu_key_tests {
                 map_markers,
                 &self.map_view,
                 &self.minimap_state,
+                &mut self.macro_editor_state,
+                &mut self.macro_books,
+                &mut self.macro_sequencer,
+                &mut self.active_macro_page,
             )
         }
     }
@@ -1108,13 +1161,21 @@ mod menu_dispatch_tests {
 
     #[test]
     fn unwired_root_entries_stay_not_implemented() {
-        for label in ["Party", "Search", "Macros"] {
+        for label in ["Party", "Search"] {
             assert_eq!(
                 resolve_menu_entry(MenuKind::Root, label),
                 MenuDispatch::NotImplemented(label.into()),
                 "{label} should still be a stub"
             );
         }
+    }
+
+    #[test]
+    fn macros_root_entry_opens_the_book_list() {
+        assert_eq!(
+            resolve_menu_entry(MenuKind::Root, "Macros"),
+            MenuDispatch::OpenSubmenu(MenuKind::Macros)
+        );
     }
 
     /// The right-pane preview (`menu::root_child_kind`) and the drill dispatch
@@ -1144,6 +1205,10 @@ mod menu_dispatch_tests {
                     );
                 }
                 (MenuDispatch::NotImplemented(_), None) => {}
+                // Macros' book-list drills are intercepted before the generic
+                // submenu push, so they surface as DrillMacroBook instead of an
+                // OpenSubmenu; treat it as agreeing with the preview kind.
+                (MenuDispatch::DrillMacroBook, Some(MenuKind::Macros)) => {}
                 (dispatch, preview) => {
                     panic!("{label}: dispatch {dispatch:?} disagrees with preview {preview:?}")
                 }
