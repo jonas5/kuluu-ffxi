@@ -5,7 +5,6 @@ use crate::hud::macros::MACRO_LINES;
 use crate::hud::style::{self, theme};
 
 pub const MACRO_EDITOR_COLUMNS: usize = 10;
-pub const MACRO_EDITOR_ROWS: usize = 2;
 
 /// Every editor dimension derives from this: the macro edit window is a
 /// low-stress text surface, so it renders 2.5x the base cell (deliberate
@@ -41,7 +40,8 @@ pub struct MacroEditorLine;
 /// HUD systems share one source of truth, like `MapScreenState`.
 #[derive(Resource, Debug, Clone, Default)]
 pub struct MacroEditorState {
-    /// 0-based focused slot (row-major 2 x 10 grid, 0..20).
+    /// 0-based focused slot, absolute within the page (rows x 10: Ctrl row
+    /// 0..9, Alt row 10..19).
     pub slot: usize,
 
     /// 0..6 line cursor within the focused slot while editing.
@@ -111,34 +111,32 @@ pub fn spawn_macro_editor(mut commands: Commands) {
                 style::text_font(scaled_px(EDITOR_HEADER_FONT_PX)),
                 TextColor(theme::TITLE),
             ));
-            for _ in 0..MACRO_EDITOR_ROWS {
-                p.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(scaled_px(EDITOR_CELL_GAP_PX)),
-                    ..default()
-                })
-                .with_children(|row| {
-                    for _ in 0..MACRO_EDITOR_COLUMNS {
-                        row.spawn((
-                            MacroEditorSlot,
-                            Text::new(""),
-                            style::text_font(scaled_px(EDITOR_CELL_FONT_PX)),
-                            TextColor(theme::TEXT),
-                            Node {
-                                height: Val::Px(scaled_px(EDITOR_CELL_HEIGHT_PX)),
-                                flex_basis: Val::Px(scaled_px(EDITOR_CELL_BASIS_PX)),
-                                flex_grow: 1.0,
-                                align_content: AlignContent::Center,
-                                border: UiRect::all(Val::Px(1.0)),
-                                padding: UiRect::horizontal(Val::Px(3.0)),
-                                ..default()
-                            },
-                            BackgroundColor(theme::CELL_BG),
-                            BorderColor::all(theme::CELL_EDGE),
-                        ));
-                    }
-                });
-            }
+            p.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(scaled_px(EDITOR_CELL_GAP_PX)),
+                ..default()
+            })
+            .with_children(|row| {
+                for _ in 0..MACRO_EDITOR_COLUMNS {
+                    row.spawn((
+                        MacroEditorSlot,
+                        Text::new(""),
+                        style::text_font(scaled_px(EDITOR_CELL_FONT_PX)),
+                        TextColor(theme::TEXT),
+                        Node {
+                            height: Val::Px(scaled_px(EDITOR_CELL_HEIGHT_PX)),
+                            flex_basis: Val::Px(scaled_px(EDITOR_CELL_BASIS_PX)),
+                            flex_grow: 1.0,
+                            align_content: AlignContent::Center,
+                            border: UiRect::all(Val::Px(1.0)),
+                            padding: UiRect::horizontal(Val::Px(3.0)),
+                            ..default()
+                        },
+                        BackgroundColor(theme::CELL_BG),
+                        BorderColor::all(theme::CELL_EDGE),
+                    ));
+                }
+            });
             for _ in 0..MACRO_LINES {
                 p.spawn((
                     MacroEditorLine,
@@ -199,25 +197,36 @@ pub fn update_macro_editor(
     if root.display != Display::Flex {
         root.display = Display::Flex;
     }
+    let row_base = (data.state.slot / MACRO_EDITOR_COLUMNS) * MACRO_EDITOR_COLUMNS;
+    let col = data.state.slot % MACRO_EDITOR_COLUMNS;
     if let Ok(mut text) = header_q.single_mut() {
+        let modifier = if row_base == 0 { "Ctrl" } else { "Alt" };
+        let key = if col == MACRO_EDITOR_COLUMNS - 1 {
+            0
+        } else {
+            col + 1
+        };
         let header = format!(
-            "Book {} / Page {} - slot {}: row {}, col {}",
+            "Book {} / Page {} - {} macro {}",
             data.book + 1,
             data.page + 1,
-            data.state.slot + 1,
-            data.state.slot / 10 + 1,
-            data.state.slot % 10 + 1,
+            modifier,
+            key,
         );
         if **text != header {
             **text = header;
         }
     }
     for (i, (mut text, mut bg)) in slot_q.iter_mut().enumerate() {
-        let label = data.slot_labels.get(i).cloned().unwrap_or_default();
+        let label = data
+            .slot_labels
+            .get(row_base + i)
+            .cloned()
+            .unwrap_or_default();
         if **text != label {
             **text = label;
         }
-        bg.0 = if i == data.state.slot {
+        bg.0 = if i == col {
             theme::CURSOR_BG
         } else {
             theme::CELL_BG

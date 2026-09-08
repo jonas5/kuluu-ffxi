@@ -3,7 +3,7 @@ use super::*;
 use crate::macro_store::{char_key, MacroBooks};
 use crate::view_native::text_input::macro_exec::{fire_macro, MacroSequencer};
 use kuluu_render::hud::macro_editor::{MacroEditorState, MACRO_EDITOR_COLUMNS};
-use kuluu_render::hud::macros::MACRO_LINES;
+use kuluu_render::hud::macros::{MACRO_LINES, MACRO_PAGES};
 use kuluu_render::ActiveMacroPage;
 
 /// Keep a locally-edited line bounded; retail's macro text box caps line length
@@ -11,16 +11,17 @@ use kuluu_render::ActiveMacroPage;
 const MACRO_LINE_MAX_CHARS: usize = 256;
 
 /// Drive the bespoke macro-page editor (`MenuKind::MacroPage`): slot navigation
-/// on the 2 x 10 grid, Enter to fire the focused macro, Tab to open one-line
-/// text entry, Esc to return to the book list. Commits write straight into
-/// `MacroBooks`, so `persist_macros_on_change` saves the character's file.
+/// across the palette's single row, Enter to fire the focused macro, Tab to
+/// open one-line text entry, Esc to return to the book list. Commits write
+/// straight into `MacroBooks`, so `persist_macros_on_change` saves the
+/// character's file.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn handle_macro_editor_key(
     key: &Key,
     bindings: &Bindings,
     stack: &mut MenuStack,
     book: usize,
-    page: usize,
+    mut page: usize,
     scene_state: &mut SceneState,
     editor: &mut MacroEditorState,
     macro_books: &mut MacroBooks,
@@ -42,52 +43,65 @@ pub(super) fn handle_macro_editor_key(
         };
     }
 
-    let axis: (i64, i64) = if bindings.matches_logical(Action::NavLeft, key) {
-        (-1, 0)
-    } else if bindings.matches_logical(Action::NavRight, key) {
-        (1, 0)
-    } else if bindings.matches_logical(Action::NavUp, key) {
-        (0, -1)
+    if bindings.matches_logical(Action::NavLeft, key) {
+        editor.slot = step_slot_in_row(editor.slot, -1);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavRight, key) {
+        editor.slot = step_slot_in_row(editor.slot, 1);
+        return None;
+    }
+    if bindings.matches_logical(Action::NavUp, key) {
+        page = step_page(page, -1);
     } else if bindings.matches_logical(Action::NavDown, key) {
-        (0, 1)
+        page = step_page(page, 1);
     } else {
-        (0, 0)
-    };
-    if axis != (0, 0) {
-        editor.slot = step_slot(editor.slot, axis.0, axis.1);
+        // Tab opens the focused slot's text entry.
+        if key == &Key::Tab {
+            start_editing(book, page, editor, macro_books, scene_state);
+            return None;
+        }
+
+        // Enter (NavConfirm or ChatSubmit) fires the focused slot's macro.
+        if bindings.matches_logical(Action::NavConfirm, key)
+            || bindings.matches_logical(Action::ChatSubmit, key)
+        {
+            fire_slot(
+                book,
+                page,
+                editor.slot,
+                scene_state,
+                macro_books,
+                macro_sequencer,
+            );
+            return None;
+        }
+
         return None;
     }
 
-    // Tab opens the focused slot's text entry.
-    if key == &Key::Tab {
-        start_editing(book, page, editor, macro_books, scene_state);
-        return None;
+    // A page change rewrites the top menu level and the shared pointer so the
+    // next frame's provider/rendering line up on the new page.
+    if let Some(level) = stack.current_mut() {
+        if let MenuKind::MacroPage { page: p, .. } = &mut level.kind {
+            *p = page;
+        }
     }
-
-    // Enter (NavConfirm or ChatSubmit) fires the focused slot's macro.
-    if bindings.matches_logical(Action::NavConfirm, key)
-        || bindings.matches_logical(Action::ChatSubmit, key)
-    {
-        fire_slot(
-            book,
-            page,
-            editor.slot,
-            scene_state,
-            macro_books,
-            macro_sequencer,
-        );
-        return None;
-    }
-
+    *active_macro_page = ActiveMacroPage { book, page };
     None
 }
 
-/// Move a 2 x 10 grid cursor, wrapping in both axes.
-fn step_slot(slot: usize, dx: i64, dy: i64) -> usize {
+/// Move a palette-row cursor, wrapping within the row (cols 0..9).
+fn step_slot_in_row(slot: usize, dx: i64) -> usize {
     let cols = MACRO_EDITOR_COLUMNS as i64;
+    let row_base = slot / MACRO_EDITOR_COLUMNS * MACRO_EDITOR_COLUMNS;
     let col = (slot as i64 % cols + dx).rem_euclid(cols);
-    let row = (slot as i64 / cols + dy).rem_euclid(2);
-    (row * cols + col) as usize
+    (row_base as i64 + col) as usize
+}
+
+/// Wrap a macro page 1..10 cursor (0-based).
+fn step_page(page: usize, dy: i64) -> usize {
+    (page as i64 + dy).rem_euclid(MACRO_PAGES as i64) as usize
 }
 
 /// Open text entry for the focused slot, preloading the first line.
@@ -253,23 +267,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn step_slot_wraps_horizontally() {
-        assert_eq!(step_slot(0, -1, 0), 9, "left of col 0 wraps to col 9");
-        assert_eq!(step_slot(9, 1, 0), 0, "right of col 9 wraps to col 0");
+    fn step_slot_in_row_wraps_horizontally() {
+        assert_eq!(
+            step_slot_in_row(0, -1),
+            9,
+            "left of col 0 wraps to col 9 in the same row"
+        );
+        assert_eq!(
+            step_slot_in_row(9, 1),
+            0,
+            "right of col 9 wraps to col 0 in the same row"
+        );
+        assert_eq!(
+            step_slot_in_row(10, -1),
+            19,
+            "alt row left of col 0 wraps to col 9"
+        );
+        assert_eq!(
+            step_slot_in_row(19, 1),
+            10,
+            "alt row right of col 9 wraps to col 0"
+        );
     }
 
     #[test]
-    fn step_slot_wraps_vertically() {
-        assert_eq!(step_slot(0, 0, -1), 10, "up from row 0 wraps to row 1");
-        assert_eq!(step_slot(10, 0, 1), 0, "down from row 1 wraps to row 0");
-    }
-
-    #[test]
-    fn step_slot_stays_in_bounds() {
+    fn step_slot_in_row_stays_in_bounds() {
         for slot in 0..20 {
-            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                assert!(step_slot(slot, dx, dy) < 20, "{slot} {dx} {dy}");
+            for dx in [1, -1] {
+                let next = step_slot_in_row(slot, dx);
+                assert!(next < 20, "{slot} {dx} -> {next}");
+                assert_eq!(
+                    next / MACRO_EDITOR_COLUMNS,
+                    slot / MACRO_EDITOR_COLUMNS,
+                    "{slot} {dx} left the row"
+                );
             }
         }
+    }
+
+    #[test]
+    fn step_page_wraps_vertically() {
+        assert_eq!(step_page(0, -1), MACRO_PAGES - 1, "page 1 up wraps to 10");
+        assert_eq!(step_page(MACRO_PAGES - 1, 1), 0, "page 10 down wraps to 1");
+        assert_eq!(step_page(0, 1), 1);
+        assert_eq!(step_page(MACRO_PAGES - 1, -1), MACRO_PAGES - 2);
     }
 }
