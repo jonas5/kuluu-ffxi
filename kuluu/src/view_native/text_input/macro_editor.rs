@@ -2,13 +2,28 @@ use super::*;
 
 use crate::macro_store::{char_key, MacroBooks};
 use crate::view_native::text_input::macro_exec::{fire_macro, MacroSequencer};
-use kuluu_render::hud::macro_editor::{MacroEditorState, MACRO_EDITOR_COLUMNS};
-use kuluu_render::hud::macros::{MACRO_LINES, MACRO_PAGES};
+use bevy::picking::events::{Click, Pointer};
+use bevy::picking::pointer::PointerButton;
+use kuluu_render::hud::macro_editor::{
+    MacroEditorLineIndex, MacroEditorSlotIndex, MacroEditorState, MACRO_EDITOR_COLUMNS,
+};
+use kuluu_render::hud::macro_palette::SLOT_LABEL_MAX_CHARS;
+use kuluu_render::hud::macros::{MACROS_PER_PAGE, MACRO_LINES, MACRO_PAGES};
 use kuluu_render::ActiveMacroPage;
 
 /// Keep a locally-edited line bounded; retail's macro text box caps line length
 /// the same way (any command this client executes is far shorter).
 const MACRO_LINE_MAX_CHARS: usize = 256;
+
+/// The first line of a macro is its name: the palette bar truncates it to
+/// `SLOT_LABEL_MAX_CHARS`, so the name field caps typing at the same width.
+fn line_cap(line: usize) -> usize {
+    if line == 0 {
+        SLOT_LABEL_MAX_CHARS
+    } else {
+        MACRO_LINE_MAX_CHARS
+    }
+}
 
 /// Drive the bespoke macro-page editor (`MenuKind::MacroPage`): slot navigation
 /// across the palette's single row, Enter to fire the focused macro, Tab to
@@ -112,8 +127,20 @@ fn start_editing(
     macro_books: &mut MacroBooks,
     scene_state: &mut SceneState,
 ) {
+    begin_editing(book, page, editor, macro_books, scene_state, 0);
+}
+
+/// Enter line-edit submode on `line`, preloading its stored text into the draft.
+fn begin_editing(
+    book: usize,
+    page: usize,
+    editor: &mut MacroEditorState,
+    macro_books: &mut MacroBooks,
+    scene_state: &mut SceneState,
+    line: usize,
+) {
     editor.editing = true;
-    editor.line = 0;
+    editor.line = line;
     load_line(book, page, editor, macro_books, scene_state);
 }
 
@@ -207,9 +234,9 @@ fn handle_line_edit_key(
     None
 }
 
-/// Caps the draft at `MACRO_LINE_MAX_CHARS`.
+/// Caps the draft at the line's width (name line is `SLOT_LABEL_MAX_CHARS`).
 fn push_draft(editor: &mut MacroEditorState, c: char) {
-    if editor.draft.chars().count() < MACRO_LINE_MAX_CHARS {
+    if editor.draft.chars().count() < line_cap(editor.line) {
         editor.draft.push(c);
     }
 }
@@ -262,6 +289,66 @@ fn commit_line(
     }
 }
 
+/// Click the editor's visible palette row or a line row to drive the editor: a
+/// slot click focuses that slot and opens the name (first line) for editing; a
+/// line click opens that line. Either commit path discards the in-flight draft
+/// into the previous slot/line first, like keyboard navigation does.
+#[allow(clippy::too_many_arguments)]
+pub fn macro_editor_click_system(
+    mut clicks: MessageReader<Pointer<Click>>,
+    q_slot: Query<&MacroEditorSlotIndex>,
+    q_line: Query<&MacroEditorLineIndex>,
+    mode: Res<InputMode>,
+    mut editor: ResMut<MacroEditorState>,
+    mut macro_books: ResMut<MacroBooks>,
+    mut scene_state: ResMut<SceneState>,
+) {
+    let InputMode::Menu(stack) = &*mode else {
+        return;
+    };
+    let Some(MenuKind::MacroPage { book, page }) = stack.current().map(|l| l.kind) else {
+        return;
+    };
+    for ev in clicks.read() {
+        if ev.button != PointerButton::Primary {
+            continue;
+        }
+        if let Ok(idx) = q_slot.get(ev.entity) {
+            if editor.editing {
+                commit_line(book, page, &mut editor, &mut macro_books, &mut scene_state);
+            }
+            let row_base = (editor.slot / MACRO_EDITOR_COLUMNS) * MACRO_EDITOR_COLUMNS;
+            let slot = row_base + idx.0;
+            if slot < MACROS_PER_PAGE {
+                editor.slot = slot;
+                begin_editing(
+                    book,
+                    page,
+                    &mut editor,
+                    &mut macro_books,
+                    &mut scene_state,
+                    0,
+                );
+            }
+            return;
+        }
+        if let Ok(idx) = q_line.get(ev.entity) {
+            if editor.editing {
+                commit_line(book, page, &mut editor, &mut macro_books, &mut scene_state);
+            }
+            begin_editing(
+                book,
+                page,
+                &mut editor,
+                &mut macro_books,
+                &mut scene_state,
+                idx.0,
+            );
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +398,27 @@ mod tests {
         assert_eq!(step_page(MACRO_PAGES - 1, 1), 0, "page 10 down wraps to 1");
         assert_eq!(step_page(0, 1), 1);
         assert_eq!(step_page(MACRO_PAGES - 1, -1), MACRO_PAGES - 2);
+    }
+
+    #[test]
+    fn name_line_caps_at_palette_label_width() {
+        assert_eq!(line_cap(0), SLOT_LABEL_MAX_CHARS);
+    }
+
+    #[test]
+    fn body_lines_keep_full_length() {
+        assert_eq!(line_cap(5), MACRO_LINE_MAX_CHARS);
+    }
+
+    #[test]
+    fn push_draft_on_name_line_stops_short() {
+        let mut editor = MacroEditorState {
+            line: 0,
+            ..default()
+        };
+        for _ in 0..(SLOT_LABEL_MAX_CHARS + 4) {
+            push_draft(&mut editor, 'x');
+        }
+        assert_eq!(editor.draft.chars().count(), SLOT_LABEL_MAX_CHARS);
     }
 }

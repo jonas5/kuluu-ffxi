@@ -705,8 +705,12 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
     );
     app.add_systems(
         Update,
-        macro_palette::macro_palette_click_system
-            .after(kuluu_render::picking::click_to_target_system)
+        (
+            macro_palette::macro_palette_click_system
+                .after(kuluu_render::picking::click_to_target_system),
+            text_input::macro_editor_click_system
+                .after(kuluu_render::picking::click_to_target_system),
+        )
             .run_if(in_state(AppPhase::InGame)),
     );
     app.add_systems(

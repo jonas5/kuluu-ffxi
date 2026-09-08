@@ -35,6 +35,7 @@ pub mod macro_exec;
 pub use macro_exec::macro_step_system;
 
 mod macro_editor;
+pub use macro_editor::macro_editor_click_system;
 
 mod menu;
 use menu::{confirm_menu_at_cursor, handle_menu_key};

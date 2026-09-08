@@ -19,6 +19,10 @@ const EDITOR_CELL_GAP_PX: f32 = 2.0;
 const EDITOR_HEADER_FONT_PX: f32 = 12.0;
 const EDITOR_CELL_FONT_PX: f32 = 10.0;
 
+/// The editing caret ("_", retail's macro-text cursor) suffixed to the focused
+/// draft while line entry is active.
+const MACRO_CARET: &str = "_";
+
 fn scaled_px(base: f32) -> f32 {
     base * EDITOR_SCALE
 }
@@ -32,8 +36,17 @@ pub struct MacroEditorHeader;
 #[derive(Component)]
 pub struct MacroEditorSlot;
 
+/// Positional index (0..9) of a slot within the visible editor row. The click
+/// system on the kuluu side uses it to resolve which slot was clicked.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct MacroEditorSlotIndex(pub usize);
+
 #[derive(Component)]
 pub struct MacroEditorLine;
+
+/// Positional index (0..5) of a line row within the focused macro's six lines.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct MacroEditorLineIndex(pub usize);
 
 /// Focus state for the bespoke macro-page editor (slot nav + one-line draft
 /// entry). Lives in kuluu-render so both the input handler (kuluu) and the
@@ -117,9 +130,10 @@ pub fn spawn_macro_editor(mut commands: Commands) {
                 ..default()
             })
             .with_children(|row| {
-                for _ in 0..MACRO_EDITOR_COLUMNS {
+                for i in 0..MACRO_EDITOR_COLUMNS {
                     row.spawn((
                         MacroEditorSlot,
+                        MacroEditorSlotIndex(i),
                         Text::new(""),
                         style::text_font(scaled_px(EDITOR_CELL_FONT_PX)),
                         TextColor(theme::TEXT),
@@ -137,9 +151,10 @@ pub fn spawn_macro_editor(mut commands: Commands) {
                     ));
                 }
             });
-            for _ in 0..MACRO_LINES {
+            for i in 0..MACRO_LINES {
                 p.spawn((
                     MacroEditorLine,
+                    MacroEditorLineIndex(i),
                     Text::new(""),
                     style::text_font(scaled_px(EDITOR_CELL_FONT_PX)),
                     TextColor(theme::TEXT),
@@ -235,7 +250,7 @@ pub fn update_macro_editor(
     for (i, (mut text, mut bg)) in line_q.iter_mut().enumerate() {
         let focused = data.state.editing && i == data.state.line;
         let text_val = if focused {
-            data.state.draft.clone()
+            format!("{}{}", data.state.draft, MACRO_CARET)
         } else {
             data.lines
                 .get(data.state.slot)
