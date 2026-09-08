@@ -110,11 +110,21 @@ pub fn spawn_macro_palette(mut commands: Commands) {
 pub fn update_macro_palette(
     data: Res<MacroPaletteData>,
     mut root_q: Query<&mut Node, (With<MacroPaletteRoot>, Without<MacroPaletteHeader>)>,
-    mut header_q: Query<&mut Text, With<MacroPaletteHeader>>,
-    mut slot_q: Query<(&mut Text, &mut BackgroundColor), With<MacroPaletteSlot>>,
+    mut header_q: Query<
+        &mut Text,
+        (With<MacroPaletteHeader>, Without<MacroPaletteSlot>),
+    >,
+    mut slot_q: Query<
+        (&mut Text, &mut BackgroundColor),
+        (With<MacroPaletteSlot>, Without<MacroPaletteHeader>),
+    >,
     mut active_q: Query<
         (&mut BackgroundColor, &mut BorderColor),
-        (With<MacroPaletteSlot>, Without<Text>),
+        (
+            With<MacroPaletteSlot>,
+            Without<Text>,
+            Without<MacroPaletteHeader>,
+        ),
     >,
 ) {
     if !data.is_changed() {

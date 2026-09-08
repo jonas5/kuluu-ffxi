@@ -145,14 +145,29 @@ pub fn spawn_macro_editor(mut commands: Commands) {
 pub fn update_macro_editor(
     data: Res<MacroEditorData>,
     mut root_q: Query<&mut Node, (With<MacroEditorRoot>, Without<MacroEditorLine>)>,
-    mut header_q: Query<&mut Text, With<MacroEditorHeader>>,
+    mut header_q: Query<
+        &mut Text,
+        (
+            With<MacroEditorHeader>,
+            Without<MacroEditorSlot>,
+            Without<MacroEditorLine>,
+        ),
+    >,
     mut slot_q: Query<
         (&mut Text, &mut BackgroundColor),
-        (With<MacroEditorSlot>, Without<MacroEditorLine>),
+        (
+            With<MacroEditorSlot>,
+            Without<MacroEditorLine>,
+            Without<MacroEditorHeader>,
+        ),
     >,
     mut line_q: Query<
         (&mut Text, &mut BackgroundColor),
-        (With<MacroEditorLine>, Without<MacroEditorSlot>),
+        (
+            With<MacroEditorLine>,
+            Without<MacroEditorSlot>,
+            Without<MacroEditorHeader>,
+        ),
     >,
 ) {
     let Ok(mut root) = root_q.single_mut() else {
