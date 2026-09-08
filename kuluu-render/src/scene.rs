@@ -874,7 +874,8 @@ mod tests {
             .add_systems(Update, sync_entities_system);
         #[cfg(not(target_arch = "wasm32"))]
         app.init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
-            .init_resource::<crate::dat_mzb::LoadMzbInFlight>();
+            .init_resource::<crate::dat_mzb::LoadMzbInFlight>()
+            .init_resource::<crate::dat_mmb::ZoneBakeState>();
         let player = app
             .world_mut()
             .spawn((
