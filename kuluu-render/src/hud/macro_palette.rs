@@ -77,7 +77,7 @@ pub fn spawn_macro_palette(mut commands: Commands) {
             UiClickSurface,
             Node {
                 position_type: PositionType::Absolute,
-                bottom: Val::Px(6.0),
+                top: Val::Px(6.0),
                 left: Val::Percent(15.0),
                 width: Val::Percent(70.0),
                 flex_direction: FlexDirection::Column,

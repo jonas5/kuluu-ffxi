@@ -7,6 +7,23 @@ use crate::hud::style::{self, theme};
 pub const MACRO_EDITOR_COLUMNS: usize = 10;
 pub const MACRO_EDITOR_ROWS: usize = 2;
 
+/// Every editor dimension derives from this: the macro edit window is a
+/// low-stress text surface, so it renders 2.5x the base cell (deliberate
+/// tuning — retail ships no macro-editor layout file to scrape).
+const EDITOR_SCALE: f32 = 2.5;
+const EDITOR_WIDTH_100PX: f32 = 560.0;
+const EDITOR_PAD_PX: f32 = 8.0;
+const EDITOR_GAP_PX: f32 = 4.0;
+const EDITOR_CELL_HEIGHT_PX: f32 = 14.0;
+const EDITOR_CELL_BASIS_PX: f32 = 50.0;
+const EDITOR_CELL_GAP_PX: f32 = 2.0;
+const EDITOR_HEADER_FONT_PX: f32 = 12.0;
+const EDITOR_CELL_FONT_PX: f32 = 10.0;
+
+fn scaled_px(base: f32) -> f32 {
+    base * EDITOR_SCALE
+}
+
 #[derive(Component)]
 pub struct MacroEditorRoot;
 
@@ -74,12 +91,12 @@ pub fn spawn_macro_editor(mut commands: Commands) {
                 position_type: PositionType::Absolute,
                 top: Val::Percent(30.0),
                 left: Val::Percent(50.0),
-                margin: UiRect::left(Val::Px(-280.0)),
-                width: Val::Px(560.0),
+                margin: UiRect::left(Val::Px(-scaled_px(EDITOR_WIDTH_100PX) / 2.0)),
+                width: Val::Px(scaled_px(EDITOR_WIDTH_100PX)),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
-                row_gap: Val::Px(4.0),
-                padding: UiRect::all(Val::Px(8.0)),
+                row_gap: Val::Px(scaled_px(EDITOR_GAP_PX)),
+                padding: UiRect::all(Val::Px(scaled_px(EDITOR_PAD_PX))),
                 border: UiRect::all(Val::Px(1.0)),
                 display: Display::None,
                 ..default()
@@ -91,13 +108,13 @@ pub fn spawn_macro_editor(mut commands: Commands) {
             p.spawn((
                 MacroEditorHeader,
                 Text::new(""),
-                style::text_font(12.0),
+                style::text_font(scaled_px(EDITOR_HEADER_FONT_PX)),
                 TextColor(theme::TITLE),
             ));
             for _ in 0..MACRO_EDITOR_ROWS {
                 p.spawn(Node {
                     flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(2.0),
+                    column_gap: Val::Px(scaled_px(EDITOR_CELL_GAP_PX)),
                     ..default()
                 })
                 .with_children(|row| {
@@ -105,11 +122,11 @@ pub fn spawn_macro_editor(mut commands: Commands) {
                         row.spawn((
                             MacroEditorSlot,
                             Text::new(""),
-                            style::text_font(10.0),
+                            style::text_font(scaled_px(EDITOR_CELL_FONT_PX)),
                             TextColor(theme::TEXT),
                             Node {
-                                height: Val::Px(14.0),
-                                flex_basis: Val::Px(50.0),
+                                height: Val::Px(scaled_px(EDITOR_CELL_HEIGHT_PX)),
+                                flex_basis: Val::Px(scaled_px(EDITOR_CELL_BASIS_PX)),
                                 flex_grow: 1.0,
                                 align_content: AlignContent::Center,
                                 border: UiRect::all(Val::Px(1.0)),
@@ -126,10 +143,10 @@ pub fn spawn_macro_editor(mut commands: Commands) {
                 p.spawn((
                     MacroEditorLine,
                     Text::new(""),
-                    style::text_font(10.0),
+                    style::text_font(scaled_px(EDITOR_CELL_FONT_PX)),
                     TextColor(theme::TEXT),
                     Node {
-                        height: Val::Px(14.0),
+                        height: Val::Px(scaled_px(EDITOR_CELL_HEIGHT_PX)),
                         border: UiRect::all(Val::Px(1.0)),
                         padding: UiRect::horizontal(Val::Px(3.0)),
                         ..default()
