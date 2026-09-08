@@ -2208,6 +2208,7 @@ pub fn kick_load_mzb_tasks(
     mut in_flight: ResMut<LoadMzbInFlight>,
     mut cache: ResMut<ZoneGeomCache>,
     mut activation: ResMut<crate::sub_area_activation::SubAreaActivation>,
+    mut bake_ctx: crate::dat_mmb::ZoneBakeCtx<'_, '_>,
 ) {
     let init_vis = compute_init_visibility(draw.zone_geom_mode);
     for req in events.read() {
@@ -2235,6 +2236,7 @@ pub fn kick_load_mzb_tasks(
                 &mut activation,
                 init_vis,
                 true,
+                &mut bake_ctx,
             );
             continue;
         }
@@ -2284,6 +2286,7 @@ pub fn poll_load_mzb_tasks(
     mut in_flight: ResMut<LoadMzbInFlight>,
     mut cache: ResMut<ZoneGeomCache>,
     mut activation: ResMut<crate::sub_area_activation::SubAreaActivation>,
+    mut bake_ctx: crate::dat_mmb::ZoneBakeCtx<'_, '_>,
 ) {
     let init_vis = compute_init_visibility(draw.zone_geom_mode);
 
@@ -2328,6 +2331,7 @@ pub fn poll_load_mzb_tasks(
                 &mut activation,
                 init_vis,
                 false,
+                &mut bake_ctx,
             );
         }
         if std::env::var("FFXI_DIAG_STREAM").is_ok() {
@@ -2600,6 +2604,7 @@ fn spawn_mzb_overlay(
     activation: &mut ResMut<crate::sub_area_activation::SubAreaActivation>,
     init_vis: (Visibility, Visibility),
     _from_cache: bool,
+    bake_ctx: &mut crate::dat_mmb::ZoneBakeCtx<'_, '_>,
 ) {
     let (init_collision_vis, init_noncollision_vis) = init_vis;
 
@@ -2952,31 +2957,87 @@ fn spawn_mzb_overlay(
         );
     }
 
+    let bake_on = req.auto_loaded && req.slot == ZONE_SLOT_MAIN && bake_ctx.real.single().is_ok();
     match &geom.mmb_spawns {
         Ok(build) => {
-            let n = build.spawns.len();
             let offset = Mat4::from_translation(req.world_pos);
-            for s in &build.spawns {
-                load_mmb_tx.write(crate::dat_mmb::LoadMmbRequest {
-                    file_id: req.file_id,
-                    chunk_idx: s.chunk_idx,
-                    world_pos: Vec3::ZERO,
-                    entity_id: None,
-                    world_transform: Some(offset * s.bevy_transform),
-                    water: s.water,
-                    lod: s.lod,
-                    door: s.door.map(|d| d.with_world_offset(req.world_pos)),
-                    slot: req.slot,
-                    sub_area_link: s.sub_area_link,
-                });
+            if bake_on {
+                // Whole-zone textured bake (xi-model-viewer parity): the merged
+                // zone is ONE ordered static bake instead of the budget-paced
+                // per-chunk streaming (which left the ground missing for minutes
+                // on a big zone — live evidence 2026-09-07, file 167). Water
+                // sheets and `_`/`@` door leaves keep streaming: water wants its
+                // own animated material per sheet, and a door leaf pose is
+                // animated per placement. Non-High LOD variants are dropped — the
+                // bake holds the author's high-detail mesh at every distance.
+                let mut bake_spawns: Vec<ZoneMmbSpawn> = Vec::new();
+                let mut bake_streamed = 0usize;
+                let mut bake_dropped = 0usize;
+                for s in &build.spawns {
+                    if s.water.is_some() || s.door.is_some() {
+                        load_mmb_tx.write(crate::dat_mmb::LoadMmbRequest {
+                            file_id: req.file_id,
+                            chunk_idx: s.chunk_idx,
+                            world_pos: Vec3::ZERO,
+                            entity_id: None,
+                            world_transform: Some(offset * s.bevy_transform),
+                            water: s.water,
+                            lod: s.lod,
+                            door: s.door.map(|d| d.with_world_offset(req.world_pos)),
+                            slot: req.slot,
+                            sub_area_link: s.sub_area_link,
+                        });
+                        bake_streamed += 1;
+                    } else if s.lod.is_none_or(|l| {
+                        (l.level_mask & ffxi_dat::mzb::MmbLodLevel::High.mask()) != 0
+                    }) {
+                        bake_spawns.push(*s);
+                    } else {
+                        bake_dropped += 1;
+                    }
+                }
+                crate::dat_mmb::kick_zone_bake(
+                    &mut bake_ctx.bake,
+                    &mut bake_ctx.parse,
+                    req.file_id,
+                    req.slot,
+                    req.world_pos,
+                    bake_spawns,
+                );
+                push_system_msg(
+                    toasts,
+                    format!(
+                        "/load_mzb {}: baking whole zone textured ({} placements; {} streamed as water/doors, {} non-High LOD dropped)",
+                        req.file_id,
+                        build.spawns.len(),
+                        bake_streamed,
+                        bake_dropped,
+                    ),
+                );
+            } else {
+                let n = build.spawns.len();
+                for s in &build.spawns {
+                    load_mmb_tx.write(crate::dat_mmb::LoadMmbRequest {
+                        file_id: req.file_id,
+                        chunk_idx: s.chunk_idx,
+                        world_pos: Vec3::ZERO,
+                        entity_id: None,
+                        world_transform: Some(offset * s.bevy_transform),
+                        water: s.water,
+                        lod: s.lod,
+                        door: s.door.map(|d| d.with_world_offset(req.world_pos)),
+                        slot: req.slot,
+                        sub_area_link: s.sub_area_link,
+                    });
+                }
+                push_system_msg(
+                    toasts,
+                    format!(
+                        "/load_mzb {}: queued {n} visual MMB placements",
+                        req.file_id
+                    ),
+                );
             }
-            push_system_msg(
-                toasts,
-                format!(
-                    "/load_mzb {}: queued {n} visual MMB placements",
-                    req.file_id
-                ),
-            );
         }
         Err(msg) => {
             push_system_msg(
@@ -3080,6 +3141,7 @@ pub fn auto_load_zone_geometry_system(
     mut pending_water: ResMut<PendingWaterSpawns>,
     mut collision_geometry: ResMut<MzbCollisionGeometry>,
     mut area_map: ResMut<ZoneAreaMap>,
+    mut bake: ResMut<crate::dat_mmb::ZoneBakeState>,
 ) {
     let current = crate::snapshot::effective_zone_file_id(&scene_state.snapshot);
     if current == last.file_id {
@@ -3119,6 +3181,9 @@ pub fn auto_load_zone_geometry_system(
     mmb_handle_cache.material.clear();
     mmb_tex_pools.by_file.clear();
     crate::dat_mmb::clear_mmb_file_textures();
+    // Drop any old-zone bake still assembling (its tasks, buckets and fallback
+    // palette layer are all discarded with the placements above).
+    bake.clear();
     // Drop any old-zone water footprints still queued for streaming; the spawned
     // ones go with the despawned AutoMzbOverlay parent above.
     pending_water.specs.clear();
@@ -3177,11 +3242,14 @@ pub fn main_zone_floor_ready(
     snapshot: &kuluu_snapshot::SceneSnapshot,
     last: &LastAutoLoadedZone,
     in_flight: &LoadMzbInFlight,
+    bake: &crate::dat_mmb::ZoneBakeState,
 ) -> bool {
     match crate::snapshot::effective_zone_file_id(snapshot) {
         None => true,
         Some(file_id) => {
-            last.file_id == Some(file_id) && !in_flight.pending_in_slot(ZONE_SLOT_MAIN)
+            last.file_id == Some(file_id)
+                && !in_flight.pending_in_slot(ZONE_SLOT_MAIN)
+                && bake.main_bake_ready(file_id)
         }
     }
 }
@@ -3223,7 +3291,14 @@ pub fn cull_mzb_by_distance(
     draw: Res<DrawDistance>,
     self_q: Query<&GlobalTransform, With<IsSelf>>,
 
-    mut mzb_q: Query<(&GlobalTransform, &mut Visibility), (With<MzbOverlay>, With<Mesh3d>)>,
+    mut mzb_q: Query<
+        (&GlobalTransform, &mut Visibility),
+        (
+            With<MzbOverlay>,
+            With<Mesh3d>,
+            Without<crate::dat_mmb::BakedZoneMesh>,
+        ),
+    >,
 ) {
     let Ok(self_t) = self_q.single() else {
         return;

@@ -252,6 +252,8 @@ pub struct ZoneFloorGate<'w> {
     last_auto: Res<'w, crate::dat_mzb::LastAutoLoadedZone>,
     #[cfg(not(target_arch = "wasm32"))]
     in_flight: Res<'w, crate::dat_mzb::LoadMzbInFlight>,
+    #[cfg(not(target_arch = "wasm32"))]
+    bake: Res<'w, crate::dat_mmb::ZoneBakeState>,
 }
 
 impl ZoneFloorGate<'_> {
@@ -261,6 +263,7 @@ impl ZoneFloorGate<'_> {
             &self.snapshot.snapshot,
             &self.last_auto,
             &self.in_flight,
+            &self.bake,
         );
         #[cfg(target_arch = "wasm32")]
         true
@@ -268,7 +271,9 @@ impl ZoneFloorGate<'_> {
 
     fn changed(&self) -> bool {
         #[cfg(not(target_arch = "wasm32"))]
-        return self.last_auto.is_changed() || self.in_flight.is_changed();
+        return self.last_auto.is_changed()
+            || self.in_flight.is_changed()
+            || self.bake.is_changed();
         #[cfg(target_arch = "wasm32")]
         self.snapshot.is_changed()
     }

@@ -1813,6 +1813,7 @@ mod tests {
             .init_resource::<kuluu_render::dat_mzb::MzbCollisionGeometry>()
             .init_resource::<kuluu_render::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<kuluu_render::dat_mzb::LoadMzbInFlight>()
+            .init_resource::<kuluu_render::dat_mmb::ZoneBakeState>()
             .init_resource::<super::super::walker::obstacles::ObstacleSet>()
             .init_resource::<kuluu_render::hud::HudPanels>()
             .init_resource::<kuluu_render::minimap::input::MinimapHoverGate>()

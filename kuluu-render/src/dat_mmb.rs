@@ -222,6 +222,7 @@ impl Plugin for DatOverlayPlugin {
             .init_resource::<MmbLoadInFlight>()
             .init_resource::<MmbTexPools>()
             .init_resource::<AppliedTextureFiltering>()
+            .init_resource::<ZoneBakeState>()
             .init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
             .init_resource::<crate::dat_mzb::DrawDistance>()
             .init_resource::<crate::dat_mzb::StreamingAnchor>()
@@ -243,6 +244,7 @@ impl Plugin for DatOverlayPlugin {
                     crate::dat_mzb::poll_load_mzb_tasks,
                     crate::dat_mzb::spawn_zone_water,
                     process_load_mmb_requests,
+                    poll_zone_bake,
                     retire_far_zone_placements,
                     crate::ffxi_actor_render::kick_load_actor_tasks,
                     crate::ffxi_actor_render::poll_load_actor_tasks,
@@ -626,10 +628,34 @@ pub fn process_load_mmb_requests(
     // Leave ~2.6ms of a 16.6ms frame for the rest of Update + render so streaming
     // can't starve frame pacing; the count ceiling still bounds a frame where
     // placements are pathological-cheap.
-    let frame_budget_ms: u64 = std::env::var("FFXI_MMB_BUDGET_MS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(14);
+    //
+    // The two consumers get different budgets. The launcher backdrop flight has
+    // no `IsSelf` (self_pos falls back to `stream_anchor`), and its camera pans
+    // over unloadable countryside — smooth pacing is the whole point there, so it
+    // keeps the cinematic 14ms default. A real in-game session DOES have `IsSelf`,
+    // and the player needs the ground under their feet now. Spawn is bounded by
+    // the budget but breaks at the first far placement, so cost tracks how many
+    // near placements are actually pending: a login into a fresh zone finds
+    // hundreds pending and bursts, while the handful that enter the radius on a
+    // boundary crossing settles in a few milliseconds regardless.
+    //
+    // Streaming a login neighborhood at the backdrop pace (~2 placements/frame,
+    // ~67/s) left the zone floor visibly missing for 30-60s with repeated
+    // multi-second rgraph stalls as the deferred geometry finally compiled (live
+    // login evidence, 2026-09-07, zone 67/file 167). The session budget drains
+    // the same neighborhood in a burst of a few frames (~5fps for ~1s).
+    let in_real_session = self_q.single().is_ok();
+    let frame_budget_ms: u64 = if in_real_session {
+        std::env::var("FFXI_MMB_SESSION_BUDGET_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(160)
+    } else {
+        std::env::var("FFXI_MMB_BUDGET_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(14)
+    };
     const MMB_SPAWN_FRAME_CEILING: usize = 1024;
     const HEAVY: usize = 8;
     const MMB_MAX_INFLIGHT: usize = 64;
@@ -692,51 +718,22 @@ pub fn process_load_mmb_requests(
                 spawned += cost;
 
                 let plc_t0 = std::time::Instant::now();
-                let texture_count = loaded.textures.len();
                 let quality = TextureQuality {
                     mipmaps: settings.texture_filtering.mipmaps(),
                     anisotropy: settings.texture_filtering.anisotropy(),
                 };
                 let pool_t0 = std::time::Instant::now();
-                let pool = tex_pools_res.by_file.entry(req.file_id).or_insert_with(|| {
-                    let mut by_name: std::collections::HashMap<String, Handle<Image>> =
-                        std::collections::HashMap::with_capacity(texture_count);
-                    let mut first: Option<Handle<Image>> = None;
-                    let mut tex_bytes = 0usize;
-                    let mut tex_px = 0usize;
-                    for (i, nt) in loaded.textures.iter().enumerate() {
-                        let img = decoded_texture_to_image(&nt.texture, quality);
-                        tex_bytes += img.data.as_ref().map(|d| d.len()).unwrap_or(0);
-                        tex_px += (nt.texture.width as usize) * (nt.texture.height as usize);
-                        let handle = images.add(img);
-                        if std::env::var("FFXI_DIAG_STREAM").is_ok() && i.is_multiple_of(5) {
-                            info!(
-                                "DIAG mmb tex [{i}/{}] {}x{} rss_mb {}",
-                                loaded.textures.len(),
-                                nt.texture.width,
-                                nt.texture.height,
-                                diag_rss_mb()
-                            );
-                        }
-                        if first.is_none() {
-                            first = Some(handle.clone());
-                        }
-                        if !nt.name.is_empty() {
-                            by_name.insert(nt.name.clone(), handle);
-                        }
-                    }
-                    if std::env::var("FFXI_DIAG_STREAM").is_ok() {
-                        info!(
-                            "DIAG mmb texpool: fid {} n {} px {} bytes MB {:.1} rss_mb {}",
-                            req.file_id,
-                            loaded.textures.len(),
-                            tex_px,
-                            tex_bytes as f64 / 1_048_576.0,
-                            diag_rss_mb()
-                        );
-                    }
-                    (by_name, first)
-                });
+                build_texture_pool(
+                    &mut images,
+                    &mut tex_pools_res.by_file,
+                    req.file_id,
+                    &loaded.textures,
+                    quality,
+                );
+                let pool = tex_pools_res
+                    .by_file
+                    .get(&req.file_id)
+                    .expect("pool built above");
                 let tex_by_name = &pool.0;
                 let first_texture = pool.1.clone();
                 pool_ns += pool_t0.elapsed().as_nanos();
@@ -1037,7 +1034,7 @@ pub fn process_load_mmb_requests(
                             req.world_pos.x, req.world_pos.y, req.world_pos.z,
                         ),
                     };
-                    let tex_note = match texture_count {
+                    let tex_note = match tex_by_name.len() {
                         0 => " (no texture)".to_string(),
                         1 => " +1 texture".to_string(),
                         n => format!(" +{n} textures"),
@@ -1242,14 +1239,74 @@ pub fn retire_far_zone_placements(
 
 /// Choose an MMB submesh's render mode, per XIM (`research/xim` ·
 /// `ZoneMeshSection.kt`). The model name (header bytes 16..32, our
-/// `zone_mesh_name`) starting with '_' selects an alpha-tested cutout at
+/// Decode one file's texture set into pooled GPU images, shared by every chunk
+/// parse of that DAT (the whole-file `Img` section is shared per file). The
+/// first consumer of a file pays the decode; later ones hit the existing pool.
+fn build_texture_pool(
+    images: &mut Assets<Image>,
+    by_file: &mut std::collections::HashMap<
+        u32,
+        (
+            std::collections::HashMap<String, Handle<Image>>,
+            Option<Handle<Image>>,
+        ),
+    >,
+    file_id: u32,
+    textures: &[NamedTexture],
+    quality: TextureQuality,
+) {
+    by_file.entry(file_id).or_insert_with(|| {
+        let mut by_name: std::collections::HashMap<String, Handle<Image>> =
+            std::collections::HashMap::with_capacity(textures.len());
+        let mut first: Option<Handle<Image>> = None;
+        let mut tex_bytes = 0usize;
+        let mut tex_px = 0usize;
+        for (i, nt) in textures.iter().enumerate() {
+            let img = decoded_texture_to_image(&nt.texture, quality);
+            tex_bytes += img.data.as_ref().map(|d| d.len()).unwrap_or(0);
+            tex_px += (nt.texture.width as usize) * (nt.texture.height as usize);
+            let handle = images.add(img);
+            if std::env::var("FFXI_DIAG_STREAM").is_ok() && i.is_multiple_of(5) {
+                info!(
+                    "DIAG mmb tex [{i}/{}] {}x{} rss_mb {}",
+                    textures.len(),
+                    nt.texture.width,
+                    nt.texture.height,
+                    diag_rss_mb()
+                );
+            }
+            if first.is_none() {
+                first = Some(handle.clone());
+            }
+            if !nt.name.is_empty() {
+                by_name.insert(nt.name.clone(), handle);
+            }
+        }
+        if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+            info!(
+                "DIAG mmb texpool: fid {} n {} px {} bytes MB {:.1} rss_mb {}",
+                file_id,
+                textures.len(),
+                tex_px,
+                tex_bytes as f64 / 1_048_576.0,
+                diag_rss_mb()
+            );
+        }
+        (by_name, first)
+    });
+}
+
 /// XIM's `discardThreshold` of 0.375; the `0x8000` flag bit marks translucency
 /// (water/glass), rendered as `AlphaMode::Blend` — the zone shader emits real
 /// alpha for these (see `flags.y` in `zone_ffxi.wgsl`). Everything else is
 /// opaque. The render mode is NEVER derived from texture alpha content — doing
 /// so punches holes in ordinary opaque ground/wall textures that carry
 /// incidental transparency.
-fn submesh_alpha_mode(zone_mesh_name: &str, blending: u16, has_texture: bool) -> (AlphaMode, f32) {
+pub(crate) fn submesh_alpha_mode(
+    zone_mesh_name: &str,
+    blending: u16,
+    has_texture: bool,
+) -> (AlphaMode, f32) {
     if !has_texture {
         (AlphaMode::Opaque, 0.0)
     } else if zone_mesh_name.starts_with('_') {
@@ -1296,6 +1353,430 @@ pub fn apply_texture_filtering_system(
         }
     }
     applied.anisotropy = Some(aniso);
+}
+
+// ---------------------------------------------------------------------------
+// Whole-zone textured bake (xi-model-viewer parity)
+//
+// A real in-game session (an `IsSelf` entity exists) gets its zone as ONE
+// ordered static bake instead of per-chunk streaming geometry: every
+// placement's MMB submeshes merge into a single world-space mesh per
+// (chunk, submesh, mirror, sub-area) key, drawn with the author's texture and
+// render state — the same order/state model as xi-model-viewer's zoneModel.js.
+// The launcher backdrop flight (no `IsSelf`) keeps the budget-paced streaming,
+// because a whole-zone bake under its panning camera stalls every frame with
+// the zone build. Generator water sheets and `_`/`@` door leaves keep streaming
+// even in bake mode: water wants its own animated material per sheet, and a
+// door leaf's pose is animated per placement.
+// ---------------------------------------------------------------------------
+
+/// Baked-zone meshes are never distance-culled (the bake IS the whole zone, so
+/// there is nothing cheaper to switch to); Bevy frustum-culls them instead.
+#[derive(Component)]
+pub struct BakedZoneMesh;
+
+/// Whether the main-block bake for a zone file is still being assembled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BakeStatus {
+    InProgress,
+    Done,
+}
+
+/// Tracked main-block bake state, read by the floor/loading gate so the player
+/// never spawns on a zone whose textured bake is still building.
+#[derive(Default, Resource)]
+pub struct ZoneBakeState {
+    /// `(file_id, slot, done)`. `None` means the current zone never asked for
+    /// a bake (backdrop flight or a non-baked load), and the gate is open.
+    pub status: Option<(u32, u8, BakeStatus)>,
+    pub active: Option<ActiveBake>,
+}
+
+impl ZoneBakeState {
+    /// Loading/floor gate: ready unless THIS zone file has a bake still being
+    /// assembled. No tracked bake (backdrop flight / non-baked load) and a
+    /// finished bake are both ready; a bake for a different file is a
+    /// zone-change race that only the reset path clears.
+    pub fn main_bake_ready(&self, file_id: u32) -> bool {
+        match self.status {
+            Some((f, _, BakeStatus::InProgress)) => f != file_id,
+            _ => true,
+        }
+    }
+
+    /// Drop in-flight bake work when the zone changes (old tasks are cancelled
+    /// by dropping them, old status cleared).
+    pub fn clear(&mut self) {
+        self.status = None;
+        self.active = None;
+    }
+}
+
+#[derive(bevy::ecs::system::SystemParam)]
+pub struct ZoneBakeCtx<'w, 's> {
+    pub real: Query<'w, 's, &'static GlobalTransform, With<crate::components::IsSelf>>,
+    pub bake: ResMut<'w, ZoneBakeState>,
+    pub parse: ResMut<'w, MmbParseCache>,
+}
+
+pub struct ActiveBake {
+    pub file_id: u32,
+    pub slot: u8,
+    pub world_pos: Vec3,
+    /// The filtered spawn list this bake covers, in placement order.
+    pub spawns: Vec<crate::dat_mzb::ZoneMmbSpawn>,
+    /// Distinct chunk indices in first-use order.
+    pub chunks: Vec<usize>,
+    pub done: std::collections::HashSet<usize>,
+    pub tasks: Vec<(usize, Task<Option<LoadedMmb>>)>,
+    /// How many `spawns` have been merged into `buckets` so far.
+    pub merged: usize,
+    /// Per-(chunk, submesh, mirror, sub-area) accumulated geometry.
+    pub buckets: std::collections::HashMap<BakeBucketKey, BakeBucket>,
+    /// Buckets awaiting entity spawn, in key-insertion order.
+    pub pending: std::collections::VecDeque<BakeBucketKey>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BakeBucketKey {
+    pub chunk_idx: usize,
+    pub sub_index: usize,
+    pub mirrored: bool,
+    pub sub_area_link: u32,
+}
+
+pub struct BakeBucket {
+    pub zone_mesh_name: String,
+    pub variant_name: String,
+    pub blending: u16,
+    pub positions: Vec<[f32; 3]>,
+    pub normals: Vec<[f32; 3]>,
+    pub uvs: Vec<[f32; 2]>,
+    pub colors: Vec<[f32; 4]>,
+    pub indices: Vec<u32>,
+}
+
+/// Per-frame cost caps. The bake runs under the floor gate, but the caps still
+/// hold on every main-thread frame: merging a placement is a few hundred vertex
+/// transforms; spawning a bucket is a Bevy mesh/material registration.
+const BAKE_MERGE_PLACEMENTS_PER_FRAME: usize = 4096;
+const BAKE_SPAWN_BUCKETS_PER_FRAME: usize = 24;
+
+/// Start assembling the main-block bake for a zone that just loaded in a real
+/// session. `spawns` has already been filtered: generator water and door-leaf
+/// placements stay on the streaming path, and non-High LOD variants are dropped
+/// (the bake holds the authored high-detail mesh at every distance).
+pub fn kick_zone_bake(
+    bake: &mut ZoneBakeState,
+    parse: &mut MmbParseCache,
+    file_id: u32,
+    slot: u8,
+    world_pos: Vec3,
+    spawns: Vec<crate::dat_mzb::ZoneMmbSpawn>,
+) {
+    let mut chunks: Vec<usize> = Vec::new();
+    for s in &spawns {
+        if !chunks.contains(&s.chunk_idx) {
+            chunks.push(s.chunk_idx);
+        }
+    }
+    let pool = AsyncComputeTaskPool::get();
+    let mut done: std::collections::HashSet<usize> = Default::default();
+    let mut tasks: Vec<(usize, Task<Option<LoadedMmb>>)> = Vec::new();
+    for &chunk_idx in &chunks {
+        if parse.by_asset.contains_key(&(file_id, chunk_idx)) {
+            done.insert(chunk_idx);
+        } else {
+            let key = (file_id, chunk_idx);
+            tasks.push((
+                chunk_idx,
+                pool.spawn(async move { load_mmb(key.0, key.1).ok() }),
+            ));
+        }
+    }
+    if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+        info!(
+            "DIAG zone bake: kick fid {} slot {} spawns {} distinct chunks {} tasks {} cached {} rss_mb {}",
+            file_id,
+            slot,
+            spawns.len(),
+            chunks.len(),
+            tasks.len(),
+            done.len(),
+            diag_rss_mb()
+        );
+    }
+    bake.status = Some((file_id, slot, BakeStatus::InProgress));
+    bake.active = Some(ActiveBake {
+        file_id,
+        slot,
+        world_pos,
+        spawns,
+        chunks,
+        done,
+        tasks,
+        merged: 0,
+        buckets: Default::default(),
+        pending: Default::default(),
+    });
+}
+
+fn merge_bake_placements(active: &mut ActiveBake, parse: &MmbParseCache, upto: usize) {
+    while active.merged < upto && active.merged < active.spawns.len() {
+        let s = active.spawns[active.merged];
+        let Some(Some(loaded)) = parse.by_asset.get(&(active.file_id, s.chunk_idx)) else {
+            active.merged += 1;
+            continue;
+        };
+        let m = s.bevy_transform;
+        let mirrored = m.determinant() < 0.0;
+        for (sub_index, sub) in loaded.submeshes.iter().enumerate() {
+            if sub.positions.is_empty() || sub.indices.is_empty() {
+                continue;
+            }
+            let key = BakeBucketKey {
+                chunk_idx: s.chunk_idx,
+                sub_index,
+                mirrored,
+                sub_area_link: s.sub_area_link,
+            };
+            let bucket = active.buckets.entry(key).or_insert_with(|| BakeBucket {
+                zone_mesh_name: loaded.zone_mesh_name.clone(),
+                variant_name: sub.variant_name.trim().to_string(),
+                blending: sub.blending,
+                positions: Vec::new(),
+                normals: Vec::new(),
+                uvs: Vec::new(),
+                colors: Vec::new(),
+                indices: Vec::new(),
+            });
+            let base = bucket.positions.len() as u32;
+            for p in &sub.positions {
+                let wp = m.transform_point3(Vec3::from_array(*p));
+                bucket.positions.push(wp.to_array());
+            }
+            if sub.normals.len() == sub.positions.len() {
+                for n in &sub.normals {
+                    let wn = m.transform_vector3(Vec3::from_array(*n)).normalize();
+                    bucket.normals.push(wn.to_array());
+                }
+            }
+            bucket.uvs.extend_from_slice(&sub.uvs);
+            bucket.colors.extend_from_slice(&sub.colors);
+            for &idx in &sub.indices {
+                bucket.indices.push(base + idx);
+            }
+        }
+        active.merged += 1;
+    }
+}
+
+/// FfxiZoneMaterial for one merged bucket: the author's texture, vertex-mapped
+/// palette, blending state and mirror pipeline, matching what the per-placement
+/// streaming path builds for the same submesh (dat_mmb.rs `process_load_mmb_requests`).
+fn spawn_baked_bucket(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<FfxiZoneMaterial>,
+    images: &mut Assets<Image>,
+    tex_pools: &mut MmbTexPools,
+    parse: &MmbParseCache,
+    file_id: u32,
+    slot: u8,
+    world_pos: Vec3,
+    key: BakeBucketKey,
+    bucket: BakeBucket,
+    settings: &GraphicsSettings,
+) {
+    let Some(loaded) = parse
+        .by_asset
+        .get(&(file_id, key.chunk_idx))
+        .and_then(|o| o.as_ref())
+    else {
+        return;
+    };
+    let quality = TextureQuality {
+        mipmaps: settings.texture_filtering.mipmaps(),
+        anisotropy: settings.texture_filtering.anisotropy(),
+    };
+    build_texture_pool(
+        images,
+        &mut tex_pools.by_file,
+        file_id,
+        &loaded.textures,
+        quality,
+    );
+    let Some((by_name, first)) = tex_pools.by_file.get(&file_id) else {
+        return;
+    };
+    let sub_texture = by_name
+        .get(&bucket.variant_name)
+        .cloned()
+        .or_else(|| first.clone());
+
+    let (alpha_mode, discard_threshold) = submesh_alpha_mode(
+        &bucket.zone_mesh_name,
+        bucket.blending,
+        sub_texture.is_some(),
+    );
+    let has_texture = if sub_texture.is_some() { 1.0 } else { 0.0 };
+    let blend_flag = if matches!(alpha_mode, AlphaMode::Blend) {
+        1.0
+    } else {
+        0.0
+    };
+    let rs = ffxi_dat::mmb::MmbRenderState::from_blending(bucket.blending);
+    let render_key = crate::ffxi_zone_material::FfxiZoneMaterialKey {
+        back_face_culling: rs.back_face_culling,
+        mirrored: key.mirrored,
+        z_bias_level: rs.z_bias_level(),
+        depth_write: rs.depth_write(),
+        generator_stage_chain: false,
+    };
+    let material = materials.add(crate::ffxi_zone_material::FfxiZoneMaterial::new(
+        sub_texture,
+        crate::skinned_ffxi_material::FfxiMaterialFlags {
+            flags: Vec4::new(
+                has_texture,
+                blend_flag,
+                crate::ffxi_zone_material::ZONE_FLAG_FOGGED,
+                discard_threshold,
+            ),
+        },
+        Vec4::ONE,
+        Vec4::ZERO,
+        alpha_mode,
+        render_key,
+    ));
+
+    let mut mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, bucket.positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, bucket.normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_UV_0, bucket.uvs);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, bucket.colors);
+    mesh.insert_indices(Indices::U32(bucket.indices));
+    let mesh_handle = meshes.add(mesh);
+
+    let is_blend = matches!(alpha_mode, AlphaMode::Blend);
+    let mut e = commands.spawn((
+        MmbOverlay,
+        BakedZoneMesh,
+        crate::components::InGameEntity,
+        crate::dat_mzb::AutoMzbOverlay,
+        crate::dat_mzb::ZoneBlockSlot(slot),
+        crate::dat_mzb::ZoneSubAreaLink(key.sub_area_link),
+        Mesh3d(mesh_handle),
+        MeshMaterial3d(material),
+        Transform::from_translation(world_pos),
+        Visibility::Inherited,
+        crate::components::CameraOccluder,
+        bevy::camera::visibility::RenderLayers::default()
+            .with(crate::minimap::topdown::MINIMAP_BAKE_LAYER),
+    ));
+    if is_blend {
+        e.insert((bevy::light::NotShadowCaster, bevy::light::NotShadowReceiver));
+    }
+}
+
+/// One phase-step of the whole-zone bake: poll parses, merge placement
+/// triangles into per-bucket world-space meshes, then spawn each bucket as a
+/// single textured entity (budget-bounded so no main-thread frame stalls).
+pub fn poll_zone_bake(
+    mut commands: Commands,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut materials: ResMut<Assets<FfxiZoneMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+    mut toasts: MessageWriter<crate::snapshot::ToastEvent>,
+    mut bake: ResMut<ZoneBakeState>,
+    mut parse: ResMut<MmbParseCache>,
+    mut tex_pools: ResMut<MmbTexPools>,
+    settings: Res<GraphicsSettings>,
+) {
+    let Some(active) = bake.active.take() else {
+        return;
+    };
+    let mut active = active;
+
+    let mut newly: Vec<(usize, Option<LoadedMmb>)> = Vec::new();
+    let mut i = 0usize;
+    while i < active.tasks.len() {
+        let result = future::block_on(future::poll_once(&mut active.tasks[i].1));
+        if let Some(loaded) = result {
+            let (ci, _task) = active.tasks.swap_remove(i);
+            newly.push((ci, loaded));
+        } else {
+            i += 1;
+        }
+    }
+    for (chunk_idx, result) in newly {
+        parse.by_asset.insert((active.file_id, chunk_idx), result);
+        active.done.insert(chunk_idx);
+    }
+
+    if active.tasks.is_empty()
+        && active.merged < active.spawns.len()
+        && active.chunks.iter().all(|c| active.done.contains(c))
+    {
+        let upto = (active.merged + BAKE_MERGE_PLACEMENTS_PER_FRAME).min(active.spawns.len());
+        merge_bake_placements(&mut active, &parse, upto);
+    }
+
+    if active.merged >= active.spawns.len() && active.pending.is_empty() {
+        active.pending.extend(active.buckets.keys().copied());
+    }
+
+    let mut spawned_this_frame = 0usize;
+    while spawned_this_frame < BAKE_SPAWN_BUCKETS_PER_FRAME {
+        let Some(key) = active.pending.pop_front() else {
+            break;
+        };
+        let Some(bucket) = active.buckets.remove(&key) else {
+            continue;
+        };
+        spawn_baked_bucket(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            &mut images,
+            &mut tex_pools,
+            &parse,
+            active.file_id,
+            active.slot,
+            active.world_pos,
+            key,
+            bucket,
+            &settings,
+        );
+        spawned_this_frame += 1;
+    }
+
+    if active.merged >= active.spawns.len()
+        && active.pending.is_empty()
+        && active.buckets.is_empty()
+    {
+        if std::env::var("FFXI_DIAG_STREAM").is_ok() {
+            info!(
+                "DIAG zone bake: done fid {} spawns {} rss_mb {}",
+                active.file_id,
+                active.spawns.len(),
+                diag_rss_mb()
+            );
+        }
+        push_system_msg(
+            &mut toasts,
+            format!(
+                "/load_mzb {}: baked textured zone ({} placements)",
+                active.file_id,
+                active.spawns.len()
+            ),
+        );
+        bake.status = Some((active.file_id, active.slot, BakeStatus::Done));
+    } else {
+        bake.active = Some(active);
+    }
 }
 
 fn mesh_debug_bundle(

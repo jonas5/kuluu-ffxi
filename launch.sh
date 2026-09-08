@@ -18,6 +18,7 @@ fi
 
 export WGPU_BACKEND="$BACKEND"
 export FFXI_DAT_PATH="${FFXI_DAT_PATH:-$HOME/HorizonXI/Game/SquareEnix/FINAL FANTASY XI}"
+export FFXI_DIAG_STREAM=1
 
 # OOM stopgap (kuluu-94n2): cap kuluu's cgroup so the kernel kills it cleanly
 # at KULUU_MEM_MAX instead of thrashing the whole machine. Set KULUU_MEM_MAX=0
