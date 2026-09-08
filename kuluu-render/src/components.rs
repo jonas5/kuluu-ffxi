@@ -14,6 +14,13 @@ pub struct IsSelf;
 #[derive(Component, Debug, Clone, Copy)]
 pub struct InGameEntity;
 
+/// HUD node that absorbs mouse clicks: a click landing on it (or any
+/// descendant) never falls through to world retargeting. The macro palette
+/// uses this so clicking a palette slot doesn't also clear the player's
+/// target through the ground underneath (see `picking::click_to_target_system`).
+#[derive(Component, Debug, Clone, Copy)]
+pub struct UiClickSurface;
+
 /// On an entity currently riding a mount, whose body its animation lifts clear
 /// of the ground the entity Transform still sits on. Anything anchored off that
 /// Transform has to answer for the difference — see [`crate::camera::nameplate_anchor_y`].

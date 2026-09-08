@@ -94,3 +94,4 @@ archive/scratch/
 
 # Legacy local SDK/runtime downloads; the optional pinned SDK is vendor/DLSS.
 /Dlss_Nvidia_dll/
+/target

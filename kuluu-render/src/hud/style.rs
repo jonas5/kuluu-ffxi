@@ -40,6 +40,8 @@ pub mod theme {
     pub const CURSOR: Color = Color::srgb(1.0, 0.84, 0.36);
     pub const CURSOR_BG: Color = Color::srgba(0.20, 0.28, 0.45, 0.65);
     pub const CELL_BG: Color = Color::srgba(0.10, 0.13, 0.24, 0.85);
+    /// Slot/cell background under the pointer (palette hover affordance).
+    pub const CELL_HOVER_BG: Color = Color::srgba(0.24, 0.32, 0.52, 0.90);
     pub const CELL_EDGE: Color = Color::srgb(0.32, 0.38, 0.52);
     pub const DANGER: Color = Color::srgb(0.95, 0.35, 0.35);
     pub const WARN: Color = Color::srgb(1.0, 0.82, 0.30);

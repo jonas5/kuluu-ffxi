@@ -1,9 +1,21 @@
 use bevy::prelude::*;
 
-use crate::components::InGameEntity;
+use crate::components::{InGameEntity, UiClickSurface};
 use crate::hud::style::{self, theme};
+use bevy::picking::hover::Hovered;
 
 pub const SLOT_LABEL_MAX_CHARS: usize = 10;
+
+/// Visible palette row: the 10 macros a held modifier step through. Positional
+/// index `row_offset + i` is the real 0..20 page slot.
+const PALETTE_SLOT_COUNT: usize = 10;
+
+/// The palette is a glanceable overlay, so the slots are roughly four times the
+/// editor's cramped cell size (deliberate tuning — retail ships no palette
+/// layout file to scrape).
+const SLOT_HEIGHT_PX: f32 = 44.0;
+const SLOT_FONT_PX: f32 = 24.0;
+const SLOT_GAP_PX: f32 = 6.0;
 
 #[derive(Component)]
 pub struct MacroPaletteRoot;
@@ -14,16 +26,23 @@ pub struct MacroPaletteHeader;
 #[derive(Component)]
 pub struct MacroPaletteSlot;
 
-#[derive(Component)]
-pub struct MacroPaletteActive;
+/// Positional index (0..9) of a slot within the visible palette row. The kuluu
+/// side uses it with `MacroPaletteData::row_offset` to open the right macro.
+#[derive(Component, Debug, Clone, Copy)]
+pub struct MacroPaletteSlotIndex(pub usize);
 
 /// The active slot (0-based) whose macro is running, `None` when idle.
 /// Written by the kuluu-side provider, consumed by `update_macro_palette`.
 #[derive(Resource, Debug, Clone, Default)]
 pub struct MacroPaletteData {
     pub header: String,
+    /// The visible row's 10 slot labels (positional 0..9), `[]` when hidden.
     pub slots: Vec<String>,
+    /// Positional index of the macro currently executing, `None` when idle.
     pub active: Option<usize>,
+    /// Offset of the visible row into `MacroPage::macros`: 0 for the Ctrl row,
+    /// `CTRL_MACRO_SLOTS` for the Alt row.
+    pub row_offset: usize,
 }
 
 impl MacroPaletteData {
@@ -55,107 +74,119 @@ pub fn spawn_macro_palette(mut commands: Commands) {
         .spawn((
             InGameEntity,
             MacroPaletteRoot,
+            UiClickSurface,
             Node {
                 position_type: PositionType::Absolute,
-                bottom: Val::Px(4.0),
-                left: Val::Percent(50.0),
-                margin: UiRect::left(Val::Px(-260.0)),
-                width: Val::Px(520.0),
+                bottom: Val::Px(6.0),
+                left: Val::Percent(15.0),
+                width: Val::Percent(70.0),
                 flex_direction: FlexDirection::Column,
                 align_items: AlignItems::Stretch,
                 row_gap: Val::Px(2.0),
                 display: Display::None,
+                padding: UiRect::all(Val::Px(4.0)),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(4.0)),
                 ..default()
             },
+            BackgroundColor(theme::FRAME_BG),
+            BorderColor::all(theme::CELL_EDGE),
         ))
         .with_children(|p| {
             p.spawn((
                 MacroPaletteHeader,
                 Text::new(""),
-                style::text_font(11.0),
+                style::text_font(13.0),
                 TextColor(theme::TITLE),
             ));
-            for _ in 0..2 {
-                p.spawn(Node {
-                    flex_direction: FlexDirection::Row,
-                    column_gap: Val::Px(2.0),
-                    ..default()
-                })
-                .with_children(|row| {
-                    for _ in 0..10 {
-                        row.spawn((
-                            MacroPaletteSlot,
-                            Text::new(""),
-                            style::text_font(10.0),
-                            TextColor(theme::TEXT),
-                            Node {
-                                height: Val::Px(14.0),
-                                flex_basis: Val::Px(48.0),
-                                flex_grow: 1.0,
-                                align_content: AlignContent::Center,
-                                border: UiRect::all(Val::Px(1.0)),
-                                padding: UiRect::horizontal(Val::Px(3.0)),
-                                ..default()
-                            },
-                            BackgroundColor(theme::CELL_BG),
-                            BorderColor::all(theme::CELL_EDGE),
-                        ));
-                    }
-                });
-            }
+            p.spawn(Node {
+                flex_direction: FlexDirection::Row,
+                column_gap: Val::Px(SLOT_GAP_PX),
+                width: Val::Percent(100.0),
+                ..default()
+            })
+            .with_children(|row| {
+                for i in 0..PALETTE_SLOT_COUNT {
+                    row.spawn((
+                        MacroPaletteSlot,
+                        MacroPaletteSlotIndex(i),
+                        Hovered::default(),
+                        Text::new(""),
+                        style::text_font(SLOT_FONT_PX),
+                        TextColor(theme::TEXT),
+                        Node {
+                            height: Val::Px(SLOT_HEIGHT_PX),
+                            flex_grow: 1.0,
+                            align_content: AlignContent::Center,
+                            border: UiRect::all(Val::Px(2.0)),
+                            padding: UiRect::horizontal(Val::Px(4.0)),
+                            ..default()
+                        },
+                        BackgroundColor(theme::CELL_BG),
+                        BorderColor::all(theme::CELL_EDGE),
+                    ));
+                }
+            });
         });
 }
 
 #[allow(clippy::type_complexity)]
 pub fn update_macro_palette(
     data: Res<MacroPaletteData>,
-    mut root_q: Query<&mut Node, (With<MacroPaletteRoot>, Without<MacroPaletteHeader>)>,
-    mut header_q: Query<
-        &mut Text,
-        (With<MacroPaletteHeader>, Without<MacroPaletteSlot>),
-    >,
-    mut slot_q: Query<
-        (&mut Text, &mut BackgroundColor),
-        (With<MacroPaletteSlot>, Without<MacroPaletteHeader>),
-    >,
-    mut active_q: Query<
-        (&mut BackgroundColor, &mut BorderColor),
+    mut root_q: Query<
+        &mut Node,
         (
-            With<MacroPaletteSlot>,
-            Without<Text>,
+            With<MacroPaletteRoot>,
             Without<MacroPaletteHeader>,
+            Without<MacroPaletteSlot>,
         ),
     >,
+    mut header_q: Query<
+        &mut Text,
+        (
+            With<MacroPaletteHeader>,
+            Without<MacroPaletteRoot>,
+            Without<MacroPaletteSlot>,
+        ),
+    >,
+    mut slot_q: Query<
+        (&mut Text, &mut BackgroundColor, &Hovered),
+        (With<MacroPaletteSlot>, Without<MacroPaletteHeader>),
+    >,
 ) {
-    if !data.is_changed() {
-        return;
-    }
     if let Ok(mut node) = root_q.single_mut() {
-        node.display = if data.visible() {
+        let display = if data.visible() {
             Display::Flex
         } else {
             Display::None
         };
+        if node.display != display {
+            node.display = display;
+        }
     }
     if let Ok(mut text) = header_q.single_mut() {
         if **text != data.header {
             **text = data.header.clone();
         }
     }
-    let slots = &data.slots;
-    for (i, (mut text, mut bg)) in slot_q.iter_mut().enumerate() {
-        let label = slots.get(i).cloned().unwrap_or_default();
+    // Hover runs per-frame (not gated on `data.is_changed()`), so the hover
+    // highlight tracks the pointer even when the macro data itself is idle.
+    for (i, (mut text, mut bg, hovered)) in slot_q.iter_mut().enumerate() {
+        let label = data.slots.get(i).cloned().unwrap_or_default();
         if **text != label {
             **text = label;
         }
-        let active = data.active == Some(i);
-        bg.0 = if active {
+        let color = if hovered.get() {
+            theme::CELL_HOVER_BG
+        } else if data.active == Some(i) {
             theme::CURSOR_BG
         } else {
             theme::CELL_BG
         };
+        if bg.0 != color {
+            bg.0 = color;
+        }
     }
-    let _ = &mut active_q;
 }
 
 #[cfg(test)]

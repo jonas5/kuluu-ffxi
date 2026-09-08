@@ -102,7 +102,7 @@ pub use camera::{
 };
 pub use components::{
     CurrRenderPos, EntityModel, HpIndicator, InGameEntity, IsSelf, LookComp, Nameplate,
-    PrevRenderPos, WorldEntity,
+    PrevRenderPos, UiClickSurface, WorldEntity,
 };
 pub use cursor::{system_cursor_icon, CursorPlugin, CursorRequests, CursorStyle};
 pub use cutscene::{CutsceneMode, CutscenePlugin, ScreenFade};

@@ -1,11 +1,14 @@
 use bevy::light::{NotShadowCaster, NotShadowReceiver};
 use bevy::picking::backend::{ray::RayMap, HitData, PointerHits};
+use bevy::picking::events::Pointer;
 use bevy::picking::hover::HoverMap;
 use bevy::picking::mesh_picking::MeshPickingPlugin;
 use bevy::picking::pointer::{PointerButton, PointerId};
 use bevy::picking::prelude::*;
 use bevy::picking::Pickable;
 use bevy::prelude::*;
+
+use crate::UiClickSurface;
 use kuluu_snapshot::EntityKind;
 
 use crate::camera::CameraMode;
@@ -372,6 +375,25 @@ fn resolve_hit_entity_id(
     nameplate_q.get(hit).ok().map(|np| np.entity_id)
 }
 
+/// True when `hit` is (or hangs under) a [`UiClickSurface`] HUD node.
+fn hit_ui_surface(
+    hit: Entity,
+    parent_q: &Query<&ChildOf>,
+    ui_q: &Query<(), With<UiClickSurface>>,
+) -> bool {
+    let mut entity = hit;
+    for _ in 0..16 {
+        if ui_q.get(entity).is_ok() {
+            return true;
+        }
+        match parent_q.get(entity) {
+            Ok(parent) => entity = parent.0,
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 pub fn resolve_click_target(
     hit_id: Option<u32>,
     current_target: Option<u32>,
@@ -416,6 +438,7 @@ pub fn click_to_target_system(
     q_world: Query<&WorldEntity>,
     q_parent: Query<&ChildOf>,
     q_nameplate: Query<&Nameplate>,
+    q_ui_surface: Query<(), With<crate::UiClickSurface>>,
     pointer: Res<crate::mouse::MousePointer>,
     scene: Res<crate::snapshot::SceneState>,
     table: Res<crate::entity_table::EntityTable>,
@@ -431,6 +454,16 @@ pub fn click_to_target_system(
         clicks.clear();
         return;
     }
+    // A click that lands on a UiClickSurface node (e.g. a macro palette slot)
+    // is fully absorbed: Bevy emits one Click per hit entity, so the world
+    // ground under the palette also reports in this frame — swallow the whole
+    // physical click so it can't clear the target through the HUD.
+    let mut ui_absorbed = false;
+    // One physical click emits one Click per hovered entity — the priority
+    // winner's surface, self's non-blocking box beside it, and the full-window
+    // surface under everything that resolves to no entity (and is what makes
+    // click-on-empty-ground reach us at all). Resolve the click exactly once:
+    // the winner's world hit if present, else the background passthrough.
     let winner = priority_hover_id(
         &hover_map,
         &bridge,
@@ -439,11 +472,6 @@ pub fn click_to_target_system(
         &q_nameplate,
         &scene.snapshot,
     );
-    // One physical click emits one Click per hovered entity — the priority
-    // winner's surface, self's non-blocking box beside it, and the full-window
-    // surface under everything that resolves to no entity (and is what makes
-    // click-on-empty-ground reach us at all). Resolve the click exactly once:
-    // the winner's world hit if present, else the background passthrough.
     let mut world_hit: Option<u32> = None;
     let mut background_hit = false;
     for ev in clicks.read() {
@@ -452,6 +480,9 @@ pub fn click_to_target_system(
         }
         if !matches!(*input_mode, InputMode::World) {
             continue;
+        }
+        if hit_ui_surface(ev.entity, &q_parent, &q_ui_surface) {
+            ui_absorbed = true;
         }
 
         if pointer.left_dragged {
@@ -462,6 +493,9 @@ pub fn click_to_target_system(
             Some(_) => {}
             None => background_hit = true,
         }
+    }
+    if ui_absorbed {
+        return;
     }
     let hit_id = match (world_hit, background_hit) {
         (Some(id), _) => Some(id),
