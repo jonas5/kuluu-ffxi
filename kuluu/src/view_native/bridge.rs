@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+
+mod mailbox;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -33,9 +35,6 @@ struct ReadyFrame {
     entity_count: usize,
 }
 
-// Mutex<Option> rather than a watch: poll_snapshot/drain_deltas take ownership
-// of the frame, so the render thread never clones; overwriting the single slot
-// keeps only the newest, which makes out-of-order delivery impossible.
 type SnapshotMailbox = Arc<Mutex<Option<ReadyFrame>>>;
 
 /// Full-snapshot triggers tracked between cycles: first frame ever, zone
@@ -79,20 +78,25 @@ fn translate_frame(
 ) -> ReadyFrame {
     let started = std::time::Instant::now();
 
-    // Merge every batch drained since the previous cycle. Removals win over
-    // upserts: an upsert-then-remove inside the window nets to a removal.
+    // The folder sends each batch under the watch write lock. Hold its read
+    // guard before draining so batches and the observed version share a boundary.
+    let guard = state_rx.borrow_and_update();
     let mut upserts: HashSet<u32> = HashSet::new();
     let mut removals: HashSet<u32> = HashSet::new();
     let mut other_changed = false;
     while let Ok(batch) = changes_rx.try_recv() {
-        upserts.extend(batch.upserts);
-        removals.extend(batch.removals);
+        for id in batch.upserts {
+            removals.remove(&id);
+            upserts.insert(id);
+        }
+        for id in batch.removals {
+            upserts.remove(&id);
+            removals.insert(id);
+        }
         other_changed |= batch.other_changed;
     }
-    upserts.retain(|id| !removals.contains(id));
 
     let (frame, entity_count) = {
-        let guard = state_rx.borrow_and_update();
         let entity_count = guard.entities.len();
         if resync.needs_full_snapshot(&guard) || other_changed {
             // A full snapshot is authoritative for everything the drained
@@ -149,13 +153,7 @@ async fn run_translator(
     loop {
         let started = tokio::time::Instant::now();
         let ready = translate_frame(&mut state_rx, &mut changes_rx, &mut resync);
-        // Take the overwritten frame out before dropping it: its Vec frees
-        // must not run inside the lock the render thread polls every frame.
-        let prev = mailbox
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .replace(ready);
-        drop(prev);
+        mailbox::publish(&mailbox, ready);
         tokio::time::sleep_until(started + TRANSLATE_MIN_PERIOD).await;
         if state_rx.changed().await.is_err() {
             break;
@@ -280,7 +278,7 @@ mod tests {
         PartyMember, Position, ReactorGoalSnapshot, ReconnectInfo, Stage, Vec3,
     };
 
-    fn populated_state() -> SessionState {
+    pub(super) fn populated_state() -> SessionState {
         let mut s = SessionState {
             stage: Stage::InZone,
             account_id: Some(1),
@@ -433,7 +431,7 @@ mod tests {
         s
     }
 
-    fn normalized(mut snap: wire::SceneSnapshot) -> serde_json::Value {
+    pub(super) fn normalized(mut snap: wire::SceneSnapshot) -> serde_json::Value {
         snap.producer_monotonic_ms = 0;
         serde_json::to_value(&snap).expect("SceneSnapshot serializes")
     }
@@ -515,7 +513,7 @@ mod tests {
         assert_eq!(snap.zone_id, Some(999), "last unseen state delivered");
     }
 
-    fn mob_entity(id: u32) -> Entity {
+    pub(super) fn mob_entity(id: u32) -> Entity {
         Entity {
             id,
             act_index: 1,
@@ -659,6 +657,37 @@ mod tests {
             }
             TranslatedFrame::Snapshot(_) => panic!("steady-state change must be a delta"),
         }
+    }
+
+    #[test]
+    fn translate_frame_respawn_wins_over_earlier_removal() {
+        let (state_tx, mut state_rx) = watch::channel(SessionState::default());
+        let (changes_tx, mut changes_rx) = mpsc::unbounded_channel();
+        let mut resync = ResyncTracker::default();
+        translate_frame(&mut state_rx, &mut changes_rx, &mut resync);
+        for event in [
+            AgentEvent::EntityUpserted {
+                entity: mob_entity(9),
+                pos_present: true,
+            },
+            AgentEvent::EntityRemoved { id: 9 },
+            AgentEvent::EntityUpserted {
+                entity: mob_entity(9),
+                pos_present: true,
+            },
+        ] {
+            fold_and_drain(&state_tx, &changes_tx, event);
+        }
+        let TranslatedFrame::Delta(delta) =
+            translate_frame(&mut state_rx, &mut changes_rx, &mut resync).frame
+        else {
+            panic!("expected entity delta");
+        };
+        assert!(delta.entities_removed.is_empty());
+        assert_eq!(delta.entities_upserted.len(), 1);
+        assert_eq!(delta.entities_upserted[0].id, 9);
+        assert!(!state_rx.has_changed().unwrap());
+        assert!(changes_rx.try_recv().is_err());
     }
 
     #[test]

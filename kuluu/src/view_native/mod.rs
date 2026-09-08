@@ -620,6 +620,7 @@ pub fn run(args: NativeRunArgs) -> Result<()> {
         (
             despawn_ingame_entities,
             drain_entity_prediction,
+            drain_entity_table,
             input::reset_local_movement,
             kuluu_render::camera::reset_camera_follow,
             drain_mzb_load_state,
@@ -957,6 +958,10 @@ fn drain_cutscene_state(
     hud_hidden.cutscene = false;
 }
 
+fn drain_entity_table(mut table: ResMut<kuluu_render::entity_table::EntityTable>) {
+    *table = default();
+}
+
 fn drain_entity_prediction(mut prediction: ResMut<kuluu_render::combat_stance::EntityPrediction>) {
     prediction.by_id.clear();
 }
@@ -1130,6 +1135,20 @@ mod zone_teardown_tests {
         world.init_resource::<kuluu_render::combat_stance::EntityMotion>();
         world.init_resource::<kuluu_render::combat_stance::AnimationBlends>();
         world
+    }
+
+    #[test]
+    fn teardown_clears_entity_table_identity() {
+        let mut world = World::new();
+        world.init_resource::<kuluu_render::entity_table::EntityTable>();
+        world
+            .resource_mut::<kuluu_render::entity_table::EntityTable>()
+            .set_self_id(Some(7));
+        world.run_system_once(super::drain_entity_table).unwrap();
+        let mut table = world.resource_mut::<kuluu_render::entity_table::EntityTable>();
+        assert!(table.is_empty());
+        assert_eq!(table.self_id(), None);
+        assert!(table.changed_ids().is_empty());
     }
 
     #[test]

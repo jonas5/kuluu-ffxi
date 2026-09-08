@@ -12,15 +12,10 @@ dist = false
 
 [features]
 default = []
-# NVIDIA DLSS Super Resolution (native Vulkan/RTX only). Compiles the runtime
-# plumbing in graphics/dlss.rs and chains to bevy's dlss feature (which pulls
-# dlss_wgpu; building it needs the DLSS SDK checked out and DLSS_SDK set — see
-# README.md#optional-dlss-builds). The settings/menu surface exists on every build; without this
-# feature it permanently reads N/A.
-# `dep:kuluu-dlss-nr` is the DLSS 5 Neural Uplift FFI crate (safe wrapper
-# around nvngx_dlssnr.dll). It must only ever be built when nvsdk_ngx_s.lib
-# is in the link graph — which is exactly what bevy/dlss -> dlss_wgpu does.
-dlss = ["bevy/dlss", "dep:kuluu-dlss-nr"]
+# SDK/toolchain setup: README.md#optional-dlss-builds.
+dlss = ["bevy/dlss"]
+# Experimental Windows NR requires SR's NGX static library in the link graph.
+enhanced-neural-uplift = ["dlss", "dep:kuluu-dlss-nr"]
 # Enhanced (non-retail) mouse-over tooltips on the status-effect ribbon showing
 # each buff's name. Retail has no such tooltip; the info comes from the scraped
 # status-effect name table.

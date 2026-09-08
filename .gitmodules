@@ -26,3 +26,7 @@
 [submodule "research/XIClient"]
 	path = research/XIClient
 	url = https://gitlab.com/Aenge/XIClient
+[submodule "vendor/DLSS"]
+	path = vendor/DLSS
+	url = https://github.com/NVIDIA/DLSS.git
+	update = none

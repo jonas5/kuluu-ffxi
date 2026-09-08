@@ -86,6 +86,20 @@ pub const LOCOMOTION_XFADE_IN: f32 = 9.0;
 
 pub const LOCOMOTION_XFADE_OUT: f32 = 7.5;
 
+// Gated burrow diagnostics (`KULUU_BURROW_LOG=1`): FSM transitions plus clip selection for
+// entities in a burrow phase, added to track down the dig-down pose releasing back to idle
+// before `status -> INVISIBLE`. Off by default; read once.
+fn burrow_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(std::env::var("KULUU_BURROW_LOG").as_deref(), Ok(v) if !v.is_empty() && v != "0")
+    })
+}
+
+// Tick counter for the gated hold probe below; advanced once per snapshot tick in
+// `tick_live_ffxi_actors` (serial section), read from the parallel pose pass.
+static BURROW_LOG_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub const WALK_RUN_BOUNDARY: f32 = 3.0;
 
 #[inline]
@@ -1108,6 +1122,12 @@ pub struct FfxiRenderActor {
     pose_work: PoseScratch,
 
     point_light_selection: Option<ActorPointLightSelection>,
+
+    /// Set while a burrower's dig-down clip has played to its buried end frame but the server
+    /// hasn't hidden it yet; `tick_live_ffxi_actors` hides the model root on this flag so the
+    /// completed one-shot can't release back to idle and flash fully-up for the ~3s before
+    /// `status -> INVISIBLE` arrives.
+    pub burrow_holding: bool,
 }
 
 impl FfxiRenderActor {
@@ -1564,6 +1584,7 @@ fn make_render_actor(
         world_pose: Vec::new(),
         pose_work: PoseScratch::default(),
         point_light_selection: None,
+        burrow_holding: false,
     }
 }
 
@@ -1982,6 +2003,13 @@ fn advance_actor_pose(
             })
         });
 
+    // Burrowing-mob dig-down / pop-up clip. Overrides idle/movement/rest the way
+    // fishing does; a worm is never moving or attacking while it burrows, so this
+    // only ever wins for entities actually in a burrow phase. Resolves to `None`
+    // (no override) when the model has no matching sp0?/sp1? clip — i.e. every
+    // non-burrowing actor and any burrower whose DAT lacks the clips.
+    let burrow_clip_id = actor_state::burrow_clip(inputs.burrow);
+
     let mut one_shot_rest = false;
     let (selected_id, is_idle) = if let Some(id) = action_id {
         (id, false)
@@ -1989,6 +2017,9 @@ fn advance_actor_pose(
         (id, false)
     } else if let Some(fc) = fishing {
         (fc.id, fc.looping)
+    } else if let Some(id) = burrow_clip_id {
+        // One-shot: dig-down holds buried until hidden; pop-up holds the emerged pose.
+        (id, false)
     } else {
         let rest_id = advance_rest_phase(rest_phase, inputs.rest, animations, elapsed_frames);
         match rest_id {
@@ -2022,6 +2053,34 @@ fn advance_actor_pose(
     } else {
         select_pose_clips_layered(animations, overlay.iter(), selected_id)
     };
+
+    // Gated burrow diagnostics: log every pose-selection change that touches a burrow clip or
+    // happens while a burrow phase is active. Catches a silent idle fallback (sp0? missing from
+    // the DAT) or a higher-priority override releasing the one-shot before INVISIBLE arrives.
+    if burrow_log_enabled() && !matches.is_empty() {
+        let changed = *current_clip != Some((selected_id, use_battle));
+        if changed {
+            let sp0 = DatId::from_str("sp0?");
+            let sp1 = DatId::from_str("sp1?");
+            let touches_burrow = selected_id.parameterized_match(&sp0)
+                || selected_id.parameterized_match(&sp1)
+                || current_clip.is_some_and(|(id, _)| {
+                    id.parameterized_match(&sp0) || id.parameterized_match(&sp1)
+                })
+                || !matches!(inputs.burrow, actor_state::BurrowPhase::None);
+            if touches_burrow {
+                tracing::info!(
+                    target: "burrow",
+                    id = actor.world_id,
+                    ?inputs.burrow,
+                    selected = %selected_id.as_str(),
+                    use_battle,
+                    matches_count = matches.len(),
+                    "pose-select"
+                );
+            }
+        }
+    }
 
     if !matches.is_empty() && *current_clip != Some((selected_id, use_battle)) {
         *current_clip = Some((selected_id, use_battle));
@@ -2057,11 +2116,14 @@ fn advance_actor_pose(
             // explicit single loop they would default to looping forever — they must play
             // once and hold the final frame until the server advances the state.
             let one_shot_fishing = matches!(fishing, Some(fc) if !fc.looping);
+            // Burrow clips are always one-shots (dig-down holds buried; pop-up holds
+            // the emerged pose until the server clears the phase).
             let loop_params = LoopParams {
                 loop_duration: None,
-                num_loops: action
-                    .and_then(|a| a.num_loops)
-                    .or((one_shot_fishing || one_shot_rest).then_some(1)),
+                num_loops: action.and_then(|a| a.num_loops).or((one_shot_fishing
+                    || one_shot_rest
+                    || burrow_clip_id.is_some())
+                .then_some(1)),
                 low_priority: false,
             };
             for &clip in &matches {
@@ -2085,6 +2147,40 @@ fn advance_actor_pose(
         .filter_map(|a| a.current_animation.as_ref().map(|c| c.current_frame))
         .next_back()
         .unwrap_or(0.0);
+
+    // Dig-down hold: once the one-shot sp0? has played to its buried end frame, keep this flag
+    // up so tick_live_ffxi_actors hides the model root until the server's INVISIBLE (or a new
+    // phase) takes over — otherwise the completed clip releases back to idle and the worm
+    // flashes fully-up for the ~3s before it is hidden.
+    let burrow_holding = matches!(inputs.burrow, actor_state::BurrowPhase::DigDown)
+        && burrow_clip_id.is_some_and(|id| {
+            coordinator.animations.iter().flatten().any(|a| {
+                a.current_animation
+                    .as_ref()
+                    .is_some_and(|c| c.animation.id.parameterized_match(&id) && c.is_done_looping())
+            })
+        });
+    actor.burrow_holding = burrow_holding;
+
+    // Gated hold probe: while a burrow phase is active, sample the pinned frame every 30 ticks
+    // so a released one-shot (suspect E) shows up as last_frame drifting back toward 0.
+    if burrow_log_enabled()
+        && !matches!(inputs.burrow, actor_state::BurrowPhase::None)
+        && BURROW_LOG_TICK
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .is_multiple_of(30)
+    {
+        tracing::info!(
+            target: "burrow",
+            id = actor.world_id,
+            ?inputs.burrow,
+            selected = %selected_id.as_str(),
+            last_frame,
+            holding = burrow_holding,
+            transitioning = coordinator.is_transitioning(),
+            "hold-probe"
+        );
+    }
 
     pose_world_mounted_into(
         world_pose,
@@ -2730,6 +2826,10 @@ pub struct SnapshotActorState {
     /// Set on a mount actor's entry when it is a ridden chocobo, whose rider is
     /// seated by their animation rather than pinned to a saddle joint.
     mount_is_chocobo: bool,
+    /// Burrowing-mob phase (dig-down / underground / pop-up), advanced from the
+    /// entity's status/animationsub transitions. `None` for non-burrowers; drives
+    /// the `sp0?`/`sp1?` clip override in [`advance_actor_pose`].
+    burrow: ffxi_actor::actor_state::BurrowPhase,
 }
 
 /// Per-entity lookups derived from `SceneState.snapshot.entities`, rebuilt only
@@ -2741,6 +2841,16 @@ pub struct LiveSnapshotIndex {
     id_by_targid: HashMap<u16, u32>,
 }
 
+/// Per-frame scratch maps rebuilt every tick by [`tick_live_ffxi_actors`]. Grouped into one
+/// `Local` so the system stays within Bevy's 16-parameter fn-item arity limit. `pub` like
+/// [`LiveSnapshotIndex`]: a Local parameter type must be visible to modules that schedule this
+/// system with `.before()`/`.after()`.
+#[derive(Default)]
+pub struct FrameScratch {
+    actor_world: HashMap<u32, Vec3>,
+    mount_attach: HashMap<u32, MountAttach>,
+}
+
 pub fn tick_live_ffxi_actors(
     time: Res<Time>,
     state: Res<crate::snapshot::SceneState>,
@@ -2750,23 +2860,75 @@ pub fn tick_live_ffxi_actors(
     self_move: Res<combat_stance::SelfMoveIntent>,
     mut registry: ResMut<FfxiSkinRegistry>,
     target: Res<crate::scene::Target>,
-    mut q_actors: Query<(&mut FfxiRenderActor, &GlobalTransform)>,
+    tracked: Res<crate::scene::TrackedEntities>,
+    // Model-root Visibility is written here only for entities in a burrow phase; every other
+    // entity's root stays owned by scene::apply_invis_flag_system (invis-flag PCs).
+    mut q_actors: Query<(&mut FfxiRenderActor, &GlobalTransform, &mut Visibility)>,
+    mut commands: Commands,
 
     mut prev_zone: Local<Option<Option<u16>>>,
     mut index: Local<LiveSnapshotIndex>,
-    mut actor_world_scratch: Local<HashMap<u32, Vec3>>,
-    mut mount_attach_scratch: Local<HashMap<u32, MountAttach>>,
+    // Per-frame scratch maps (see FrameScratch); one Local instead of two keeps the system
+    // within Bevy's 16-parameter fn-item arity limit.
+    mut frame_scratch: Local<FrameScratch>,
+    // Last-observed burrow phase per entity. Persists across frames (a `Local`), so the FSM
+    // can advance from the previous snapshot's state; rebuilt entries read their prior phase
+    // here rather than resetting to idle on every change.
+    mut burrow_mem: Local<HashMap<u32, ffxi_actor::actor_state::BurrowPhase>>,
 ) {
     use ffxi_actor::actor_state::RestKind;
 
     let elapsed_frames = time.delta_secs() * FRAME_RATE;
     let self_id = state.snapshot.self_char_id;
 
+    // Burrow effect routines queued by this frame's FSM transitions, mirroring retail
+    // (FFXiMain.dll F19-F22): dig = sub set on a live actor -> the DAT's `ini1` routine
+    // (Motion sp1? + dirt generators + sound); pop-up = visible status with no actor ->
+    // fresh model load running `init` (Motion sp0? + dirt generators + sound). We keep one
+    // hidden actor instead of destroying/rebuilding it, so both fire on the same entity.
+    // Motion stages are suppressed when flattened — the sp1?/sp0? clips stay owned by the
+    // pose pass, so only VFX/sound come from the routine. A sub-clear arriving mid-routine
+    // does nothing in retail (the routine finishes), so there is no early-cancel path here.
+    let mut burrow_routines: Vec<(u32, [u8; 4])> = Vec::new();
+
     if state.is_changed() {
+        use ffxi_actor::actor_state::{next_burrow_phase, BurrowPhase};
+
         index.by_id.clear();
         index.id_by_targid.clear();
+        let mut live_ids = std::collections::HashSet::new();
         for e in &state.snapshot.entities {
+            live_ids.insert(e.id);
             let mounted = state.snapshot.mount_of(e).is_some();
+            // Advance the burrow FSM from last frame's phase to this snapshot's
+            // status/animationsub. A no-op (stays `None`) for every non-burrowing
+            // entity, so it is safe to run for all of them.
+            let prev_burrow = burrow_mem.get(&e.id).copied().unwrap_or(BurrowPhase::None);
+            let burrow = next_burrow_phase(prev_burrow, e.status, e.animationsub);
+            match (prev_burrow, burrow) {
+                (BurrowPhase::None, BurrowPhase::DigDown) => {
+                    burrow_routines.push((e.id, *b"ini1"));
+                }
+                (BurrowPhase::Underground, BurrowPhase::PopUp) => {
+                    burrow_routines.push((e.id, *b"init"));
+                }
+                _ => {}
+            }
+            if burrow_log_enabled()
+                && burrow != prev_burrow
+                && (prev_burrow != BurrowPhase::None || burrow != BurrowPhase::None)
+            {
+                tracing::info!(
+                    target: "burrow",
+                    id = e.id,
+                    ?prev_burrow,
+                    new = ?burrow,
+                    status = e.status,
+                    sub = e.animationsub,
+                    "fsm"
+                );
+            }
+            burrow_mem.insert(e.id, burrow);
             index.by_id.insert(
                 e.id,
                 SnapshotActorState {
@@ -2780,6 +2942,7 @@ pub fn tick_live_ffxi_actors(
                     motion_from: None,
                     rider_race: 0,
                     mount_is_chocobo: false,
+                    burrow,
                 },
             );
             index.id_by_targid.insert(e.act_index, e.id);
@@ -2804,12 +2967,51 @@ pub fn tick_live_ffxi_actors(
                             .snapshot
                             .mount_of(e)
                             .is_some_and(|m| m.is_chocobo()),
+                        burrow: BurrowPhase::None,
                     },
                 );
             }
         }
+        // Drop phases for entities that despawned so the cache stays bounded.
+        burrow_mem.retain(|id, _| live_ids.contains(id));
+    }
+
+    // Fire the queued routines on their wire entities: it carries a world-space Transform (the
+    // particle/sound origin) and is what the stage-dispatch systems read `(Transform,
+    // Option<ActionAssets>)` off. The actor's own ActionAssets hold this DAT's SEPs and dirt
+    // generators, so they ride along for resolution.
+    for (world_id, routine) in burrow_routines {
+        let Some(&wire_e) = tracked.by_id.get(&world_id) else {
+            continue;
+        };
+        // Model not loaded yet: the clip still plays from the pose pass; only the dirt and
+        // sound are lost. Acceptable degradation — the load lands within a few frames.
+        let Some((actor, _, _)) = q_actors.iter().find(|(a, _, _)| a.world_id == world_id) else {
+            continue;
+        };
+        let lookup = crate::scheduler_runtime::RoutineLookup::new().with_actor(actor.routines());
+        let Some(active) =
+            crate::scheduler_runtime::ActiveScheduler::effects_only(&lookup, &routine)
+        else {
+            continue;
+        };
+        commands
+            .entity(wire_e)
+            .try_insert(active)
+            .try_insert(actor.action_assets().clone())
+            .try_insert(crate::scheduler_runtime::ActionTarget(None));
+    }
+
+    if burrow_log_enabled() {
+        BURROW_LOG_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     let index: &LiveSnapshotIndex = &index;
+    // Split borrows of the scratch fields: each `.field` access through the Local's DerefMut
+    // would take its own whole-value mutable borrow, so materialize one plain `&mut`
+    // first and borrow disjoint fields from it.
+    let frame_scratch = &mut *frame_scratch;
+    let actor_world_scratch = &mut frame_scratch.actor_world;
+    let mount_attach_scratch = &mut frame_scratch.mount_attach;
 
     // Head-look must aim at where the target is *rendered* (grounded), not its
     // raw wire Y — the server sends pathing NPCs a flat reference Y, so wire and
@@ -2818,9 +3020,9 @@ pub fn tick_live_ffxi_actors(
     actor_world_scratch.extend(
         q_actors
             .iter()
-            .map(|(a, gt)| (a.world_id, gt.translation())),
+            .map(|(a, gt, _)| (a.world_id, gt.translation())),
     );
-    let actor_world_by_id: &HashMap<u32, Vec3> = &actor_world_scratch;
+    let actor_world_by_id: &HashMap<u32, Vec3> = actor_world_scratch;
 
     // Where each rider's body has to be pinned, for the mounts that pin one.
     // Read off the mount actor's posed skeleton, which shares the rider's root
@@ -2829,7 +3031,7 @@ pub fn tick_live_ffxi_actors(
     // the two actors are posed in the same pass and a frame of lag on a seat is
     // not visible.
     mount_attach_scratch.clear();
-    for (a, _) in &q_actors {
+    for (a, _, _) in &q_actors {
         let Some(rider_id) = crate::scene::mount_actor_rider(a.world_id) else {
             continue;
         };
@@ -2854,7 +3056,7 @@ pub fn tick_live_ffxi_actors(
             );
         }
     }
-    let mount_attach_by_rider: &HashMap<u32, MountAttach> = &mount_attach_scratch;
+    let mount_attach_by_rider: &HashMap<u32, MountAttach> = mount_attach_scratch;
 
     let self_engaged_predicted = matches!(
         state.snapshot.current_goal,
@@ -2899,7 +3101,7 @@ pub fn tick_live_ffxi_actors(
     let motion = &*motion;
     q_actors
         .par_iter_mut()
-        .for_each(|(mut actor, actor_global)| {
+        .for_each(|(mut actor, actor_global, mut vis)| {
             let world_id = actor.world_id;
             if world_id == 0 {
                 return;
@@ -2960,6 +3162,15 @@ pub fn tick_live_ffxi_actors(
                 snap.and_then(|s| s.fishing_phase)
             };
 
+            // Burrowing-mob phase (dig-down / pop-up). Self never burrows; observed
+            // entities carry the FSM state advanced in the snapshot index above.
+            let burrow = if is_self {
+                ffxi_actor::actor_state::BurrowPhase::None
+            } else {
+                snap.map(|s| s.burrow)
+                    .unwrap_or(ffxi_actor::actor_state::BurrowPhase::None)
+            };
+
             let engage_state = {
                 let actor: &mut FfxiRenderActor = &mut actor;
                 advance_engage(
@@ -2986,6 +3197,7 @@ pub fn tick_live_ffxi_actors(
                 dead,
                 rest: rest_kind,
                 fishing_phase,
+                burrow,
                 mount_or_chocobo: snap.is_some_and(|s| s.mount_or_chocobo),
                 ..Default::default()
             };
@@ -3020,9 +3232,23 @@ pub fn tick_live_ffxi_actors(
             let mount_attach = mount_attach_by_rider.get(&world_id).copied();
 
             advance_actor_pose(&mut actor, elapsed_frames, look, mount_attach);
+
+            // Burrow visibility hold (see FfxiRenderActor::burrow_holding): once the dig-down
+            // one-shot has completed but the server hasn't hidden it yet, keep the model root
+            // invisible; Underground is hidden by status. Never write for burrow == None —
+            // those roots belong to scene::apply_invis_flag_system.
+            if !matches!(burrow, ffxi_actor::actor_state::BurrowPhase::None) {
+                let hide = matches!(burrow, ffxi_actor::actor_state::BurrowPhase::Underground)
+                    || actor.burrow_holding;
+                *vis = if hide {
+                    Visibility::Hidden
+                } else {
+                    Visibility::default()
+                };
+            }
         });
 
-    for (actor, _) in &q_actors {
+    for (actor, _, _) in &q_actors {
         registry
             .skin_mut(actor.skin_slot)
             .joints
@@ -3030,7 +3256,7 @@ pub fn tick_live_ffxi_actors(
     }
 
     if let Some(self_id) = self_id {
-        if let Some((actor, _)) = q_actors.iter().find(|(a, _)| a.world_id == self_id) {
+        if let Some((actor, _, _)) = q_actors.iter().find(|(a, _, _)| a.world_id == self_id) {
             rest.observe_exit_clip(matches!(actor.rest_phase, RestPlayback::Stopping { .. }));
         }
     }

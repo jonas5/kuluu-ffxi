@@ -91,6 +91,7 @@ dynamic_linking = ["bevy/dynamic_linking"]
 # Build-time requirements (DLSS SDK + Vulkan SDK + clang; dlss_wgpu's build.rs
 # panics without DLSS_SDK) and the runtime DLL story live in README.md#optional-dlss-builds.
 dlss = ["native-window", "kuluu-render/dlss", "bevy/dlss"]
+enhanced-neural-uplift = ["dlss", "kuluu-render/enhanced-neural-uplift"]
 # DEV-ONLY: the in-game Debug menu (page 2 of Commands, incl. its Retail+
 # section with the DLSS/Job Display gates). Never part of a shipped release
 # build — retail parity holds by construction; dev builds pass it explicitly,

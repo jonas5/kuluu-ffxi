@@ -783,6 +783,16 @@ fn first_decode_err(opcode: u16) -> bool {
         .unwrap_or(true)
 }
 
+/// Gated burrow wire diagnostics (`KULUU_BURROW_LOG=1`, same switch as the render-side FSM
+/// log): raw status/sub observations for every CHAR_NPC update that could drive a burrow FSM.
+/// Off by default; read once.
+fn burrow_wire_log_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(std::env::var("KULUU_BURROW_LOG").as_deref(), Ok(v) if !v.is_empty() && v != "0")
+    })
+}
+
 fn handle_sub_packet(
     sub: &framing::SubPacket<'_>,
     event_tx: &broadcast::Sender<AgentEvent>,
@@ -1181,6 +1191,28 @@ fn handle_sub_packet(
                 }
                 .unwrap_or(0);
 
+                // Burrow wire probe (KULUU_BURROW_LOG=1): raw status/sub for every update that
+                // could drive a burrow FSM — dig start (sub set while visible), buried ticks
+                // (status INVISIBLE), pop-up/settle. Answers "what does the server actually send?"
+                if op == s2c::CHAR_NPC
+                    && matches!(kind, EntityKind::Mob | EntityKind::Pet)
+                    && burrow_wire_log_enabled()
+                {
+                    if let Some(ns) = decode::NpcState::decode_char_npc(sub.data) {
+                        // 0x04 is the spawn flag LSB ORs into animationsub (see NpcState docs).
+                        if ns.status == 3 || (ns.animationsub & !0b100) != 0 {
+                            tracing::info!(
+                                target: "burrow",
+                                id = head.unique_no,
+                                send_flag = format!("0x{:02x}", send_flag),
+                                status = ns.status,
+                                sub = ns.animationsub,
+                                "wire"
+                            );
+                        }
+                    }
+                }
+
                 const UPDATE_POS: u8 = 0x01;
                 let pos_present = send_flag & UPDATE_POS != 0;
                 // sendflags_t.Model (bit 4) — the Model block that carries
@@ -1251,6 +1283,7 @@ fn handle_sub_packet(
 
                             kind: None,
                             hp_pct: None,
+                            allegiance: None,
                         });
                     }
                 }
@@ -1282,6 +1315,7 @@ fn handle_sub_packet(
                         name: pet.name,
                         kind: Some(EntityKind::Pet),
                         hp_pct: Some(pet.hp_pct),
+                        allegiance: None,
                     });
                 }
             }
@@ -1408,6 +1442,17 @@ fn handle_sub_packet(
                     let _ = event_tx.send(AgentEvent::SelfServerStatus {
                         status: cs.server_status,
                         mount_id: cs.mount_id,
+                    });
+                    // Self allegiance rides this packet, not 0x0D — the server
+                    // skips its own char update (zone_entities.cpp), and the
+                    // nameplate's belligerence colour keys off Flags2.BallistaFlg.
+                    let _ = event_tx.send(AgentEvent::EntityPatched {
+                        id: Some(self_char_id),
+                        act_index: None,
+                        name: None,
+                        kind: None,
+                        hp_pct: None,
+                        allegiance: Some(cs.allegiance),
                     });
                 }
             }

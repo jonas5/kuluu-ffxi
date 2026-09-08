@@ -307,8 +307,6 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                 (
                     (
                         sync_entities_system,
-                        // Chained after sync: on a dirty frame that sets InvisFlag, sync
-                        // resets the orb material to its kind handle first and this blanks it.
                         scene::apply_invis_flag_system,
                         sync_entity_looks_system,
                         scene::ensure_self_lookcomp_system,
@@ -449,8 +447,14 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
                 .before(ffxi_actor_render::tick_live_ffxi_actors),
         );
 
+        // After apply_invis_flag_system: it resets every non-WireEntity model root's Visibility
+        // each frame (invis-flag PCs), and the burrow-phase hold in tick_live_ffxi_actors must
+        // win that write for entities digging down.
         #[cfg(not(target_arch = "wasm32"))]
-        app.add_systems(Update, ffxi_actor_render::tick_live_ffxi_actors);
+        app.add_systems(
+            Update,
+            ffxi_actor_render::tick_live_ffxi_actors.after(scene::apply_invis_flag_system),
+        );
 
         #[cfg(not(target_arch = "wasm32"))]
         app.add_systems(
@@ -477,7 +481,10 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
             scene::auto_clear_target_system.before(sync_entities_system),
         );
 
-        app.add_systems(Update, self_visibility_for_camera_mode_system);
+        app.add_systems(
+            Update,
+            self_visibility_for_camera_mode_system.after(sync_entities_system),
+        );
 
         app.add_systems(
             Update,
@@ -517,7 +524,7 @@ impl<S: SceneSource + Resource + Component<Mutability = bevy::ecs::component::Mu
         // DLSS 5 Neural Uplift (NR): registers its main-world apply system +
         // component extraction plugin, and the render-world prepare/node
         // systems (see graphics/dlss_nr.rs). No-op without nvngx_dlssnr.dll.
-        #[cfg(all(target_os = "windows", feature = "dlss"))]
+        #[cfg(all(target_os = "windows", feature = "enhanced-neural-uplift"))]
         graphics::dlss_nr::register(app);
 
         #[cfg(not(target_arch = "wasm32"))]

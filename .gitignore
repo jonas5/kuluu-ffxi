@@ -1,4 +1,4 @@
-﻿# Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
+# Rust workspace artifacts (defense-in-depth; component .gitignores cover this too)
 **/target/
 **/*.rs.bk
 
@@ -91,3 +91,6 @@ artifacts/
 
 # Session scratch + crash dumps (rustc ICE logs, saved pre-rewrite file versions) — local only.
 archive/scratch/
+
+# Legacy local SDK/runtime downloads; the optional pinned SDK is vendor/DLSS.
+/Dlss_Nvidia_dll/

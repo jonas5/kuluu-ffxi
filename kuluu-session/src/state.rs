@@ -1655,6 +1655,7 @@ impl SessionState {
                     self.entity_index.insert(entity.id, self.entities.len());
                     self.entities.push(inserted);
                     self.pending_entity_upserts.insert(entity.id);
+                    self.pending_entity_removals.remove(&entity.id);
                     true
                 }
             }
@@ -1689,6 +1690,7 @@ impl SessionState {
                 name,
                 kind,
                 hp_pct,
+                allegiance,
             } => {
                 // Index first (the common case: the patcher knows the wire id);
                 // fall back to a scan when only an act_index was given.
@@ -1716,6 +1718,15 @@ impl SessionState {
                     if let Some(hp) = hp_pct {
                         if existing.hp_pct != Some(*hp) {
                             existing.hp_pct = Some(*hp);
+                            changed = true;
+                        }
+                    }
+                    if let Some(a) = allegiance {
+                        // Self's entity may still carry no flags at all (it never
+                        // receives its own 0x0D), so materialize rather than skip.
+                        if existing.char_flags.as_ref().map(|f| f.allegiance) != Some(*a) {
+                            let flags = existing.char_flags.get_or_insert_with(Default::default);
+                            flags.allegiance = *a;
                             changed = true;
                         }
                     }
@@ -2568,6 +2579,10 @@ pub enum AgentEvent {
         kind: Option<EntityKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         hp_pct: Option<u8>,
+        /// Self allegiance out of 0x037 `Flags2.BallistaFlg` — the only channel
+        /// for self (the server skips its own 0x0D).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allegiance: Option<u8>,
     },
     ChatLine {
         line: ChatLine,

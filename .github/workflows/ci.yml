@@ -111,3 +111,19 @@ jobs:
 
       - name: Test
         run: scripts/checks.sh test
+
+  wasm:
+    name: wasm
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CXXFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-build
+        with:
+          targets: wasm32-unknown-unknown
+          cache-key: ci-wasm
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Check browser viewer
+        run: scripts/checks.sh wasm

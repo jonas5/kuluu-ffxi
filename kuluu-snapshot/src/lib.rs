@@ -2,10 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-// v24: Entity.char_flags.invis — flags1 InvisFlag (bit 29), the server's
-// player-invisibility bit. LSB sets it for PCs only (m_isGMHidden or an
-// EFFECTFLAG_INVISIBLE status effect); retail keeps such players targetable but
-// draws nothing. Never gates targeting, unlike untargetable.
+// v24: Entity.monstrosity and CharFlags.{invis, job_master_display}.
 // v23: SceneSnapshot.death_menu_offer — the durable s2c 0x0F9 Raise/Reraise or
 // Tractor offer shown while dead. (Upstream's "v20"; renumbered on merge because our
 // side had already spent 20-22 on zone_generation / untargetable / name_vis.)
@@ -52,7 +49,7 @@ use serde::{Deserialize, Serialize};
 // v5: InventoryItem.charges_remaining + next_use_vana_ts (item recast/charges).
 // v4: SceneSnapshot.delivery_box (dedicated delivery screen) + ViewerCommand::DeliveryBox
 // (postcard frames are not self-describing, so any shape change bumps this).
-pub const PROTOCOL_VERSION: u32 = 23;
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Longest countdown `SceneSnapshot::status_icon_expiries` can carry. The
 /// producer rejects anything beyond it as a corrupt 0x063 timestamp, and the HUD

@@ -6,7 +6,7 @@
 # cargo flags themselves, so the two can't drift: a green pre-push run uses
 # the *exact* fmt/clippy invocation CI will, and vice versa.
 #
-# Usage: scripts/checks.sh <stage>...   stage ∈ {harness, fmt, clippy, test, build, doc}
+# Usage: scripts/checks.sh <stage>...   stage ∈ {harness, fmt, clippy, test, build, wasm, doc}
 #   scripts/checks.sh harness fmt clippy      # pre-push default
 #   scripts/checks.sh harness fmt clippy test # the CI gate (ci.yml runs these)
 #   scripts/checks.sh build                   # local-only: see run_build below
@@ -28,30 +28,15 @@ fi
 
 cd "$(git rev-parse --show-toplevel)"
 
-# The single feature set the client/viewer build under. Keep in lockstep with
-# the release workflow's build flags (which pass --no-default-features because
-# their runners have no DLSS SDK).
-#
-# dlss is opt-in, but building bevy/dlss needs the DLSS SDK + Vulkan SDK +
-# libclang in the environment (dlss_wgpu's build.rs panics without them). When
-# this checkout has the in-repo streamline/ SDK and the vars are unset, point
-# at it so bare gate runs keep dlss in the lint graph; anywhere else (CI
-# runners, release legs, Steam Deck docker) drop default features so kuluu
-# builds without dlss.
-if [ -z "${DLSS_SDK:-}" ] && [ -d "streamline/sdk/include" ]; then
-  export DLSS_SDK="$PWD/streamline/sdk"
-fi
-if [ -z "${VULKAN_SDK:-}" ] && [ -d "streamline/vulkan-sdk/Include" ]; then
-  export VULKAN_SDK="$PWD/streamline/vulkan-sdk"
-fi
-if [ -z "${LIBCLANG_PATH:-}" ] && [ -d "streamline/llvm/bin" ]; then
-  export LIBCLANG_PATH="$PWD/streamline/llvm/bin"
-fi
-if [ -n "${DLSS_SDK:-}" ] && [ -n "${VULKAN_SDK:-}" ]; then
-  FEATURES=(--features native-window,dlss)
-else
-  echo "checks: no DLSS SDK in the environment — building without the dlss feature"
-  FEATURES=(--no-default-features --features native-window)
+# Installing an SDK must not change the vanilla gate's feature graph.
+FEATURES=(--no-default-features --features native-window)
+if [ "${KULUU_CHECK_DLSS:-0}" = "1" ]; then
+  export DLSS_SDK="${DLSS_SDK:-$PWD/vendor/DLSS}"
+  if [ ! -f "$DLSS_SDK/include/nvsdk_ngx.h" ] || [ -z "${VULKAN_SDK:-}" ]; then
+    echo "checks: DLSS needs its SDK and VULKAN_SDK; see cargo xtask dlss check" >&2
+    exit 1
+  fi
+  FEATURES=(--no-default-features --features native-window,dlss)
 fi
 
 # Route every cargo invocation through the stall watchdog so a jobserver wedge
@@ -228,6 +213,10 @@ run_build() {
   cargo build --workspace --locked "${FEATURES[@]}"
 }
 
+run_wasm() {
+  cargo check -p kuluu-viewer-wasm --locked --target wasm32-unknown-unknown
+}
+
 run_doc() {
   # Comment/doc-rot discipline. Advisory at the call site (CI marks the step
   # continue-on-error) until the tree reports zero.
@@ -262,6 +251,7 @@ for stage in "$@"; do
     harness) echo "checks: harness"; run_harness ;;
     test)   echo "checks: test";   run_test ;;
     build)  echo "checks: build";  run_build ;;
+    wasm)   echo "checks: wasm";   run_wasm ;;
     doc)    echo "checks: doc";    run_doc ;;
     *) echo "checks: unknown stage '$stage'" >&2; exit 2 ;;
   esac

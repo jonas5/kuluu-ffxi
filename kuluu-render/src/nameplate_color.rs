@@ -55,6 +55,21 @@ const ALLEGIANCE_COLOR_INDICES: [(u8, usize); 5] = [(2, 18), (3, 19), (4, 20), (
 const ALLEGIANCE_COLORED_MIN: u8 = 2;
 const ALLEGIANCE_COLORED_MAX: u8 = 99;
 
+/// The belligerence bit LSB ORs into the allegiance byte while a monstrosity is
+/// outside the Ferretory (`Flags3.BallistaTeam |= 0x08`, char_update.cpp;
+/// `Flags2.BallistaFlg |= 0x08`, char_status.cpp), on top of the base
+/// ALLEGIANCE_TYPE. A player's base is always PLAYER (charentity.cpp:127), so a
+/// belligerent one reads BELLIGERENT_PLAYER_ALLEGIANCE on the wire; the MOB
+/// result only reaches it through an unvalidated `setAllegiance` script call.
+/// The colour logic deliberately does not branch on these — retail maps 8/9 to
+/// the PC row without returning, and every later check overwrites or matches
+/// that white, so falling through is equivalent; they exist to name the wire
+/// values in the tests pinning that behaviour.
+#[allow(dead_code)] // test fixture + wire documentation; see doc comment
+const BELLIGERENT_MOB_ALLEGIANCE: u8 = 0b1_000;
+#[allow(dead_code)] // ditto
+const BELLIGERENT_PLAYER_ALLEGIANCE: u8 = 0b1_001;
+
 /// The nameplate's diffuse colour is drawn through `D3DTOP_MODULATE2X`
 /// (`CXiActorNameDraw::OnMove`), so the 0x7F-based table
 /// values reach the screen doubled.
@@ -238,10 +253,31 @@ const DEFAULT_ROW: [Color; NAME_COLOR_COUNT] = [
 
 /// Port of `ActorTelemetry::NameColorSet`
 /// (research/XIClient/.../ActorTelemetry.cpp `NameColorSet`),
-/// keeping retail's precedence. The branches that need a live event, ballista
-/// or Monstrosity context (the forced `AUDIT_1D8` colour, the `AUDIT_1D0 & 4`
-/// PvP override, the linked-actor inheritance) have no counterpart in the
-/// snapshot yet and are skipped, not guessed.
+/// keeping retail's precedence. The branches with no live LSB wire source are
+/// skipped, not guessed:
+/// - the forced `AUDIT_1D8` colour index — an event/cutscene override; no s2c
+///   field carries it in vendor/server;
+/// - the `AUDIT_1D0 & 4` PvP team override — retail derives bit 4 from its party
+///   walk and gates on MovementFlags.PvPFlag, which LSB never writes (char_update.cpp
+///   hardcodes `Flags2.PvPFlag = 0`);
+/// - the linked-actor inheritance (`AUDIT_1D0 & 0x100`) — the bit is derived
+///   client-side from CharmFlag; our `charm && !pet → PARTY` below is the
+///   documented adaptation, and copying a partner's computed colour needs retail
+///   internals that are not verifiable against LSB;
+/// - the `AUDIT_294` sub-allegiance switch — BallistaInfo byte 0x2E; declared in
+///   char_update.cpp but never written by any vendored path;
+/// - team categories 32–39 (even → row 18, odd → row 19) and the 40–43 pairing —
+///   nothing in vendored LSB writes them: `/setallegiance` caps at 6 and only
+///   reaches players, so an unvalidated `setAllegiance` script call is the sole
+///   source.
+///
+/// Belligerence (8/9) does have a live wire source — char_update.cpp /
+/// char_status.cpp OR in 0x08 outside the Ferretory — but retail's block maps it
+/// to the PC row *without returning*, so every check that runs after it here
+/// (GM, claim, party, yell) overwrites or matches that white anyway; falling
+/// through is the faithful port. Self receives its own byte via 0x037
+/// `Flags2.BallistaFlg` (the server skips its own 0x0D), decoded into this same
+/// field.
 pub fn name_color_choice(entity: &Entity, ctx: SelfContext<'_>) -> NameColorChoice {
     use NameColorChoice::Row;
     let flags = &entity.char_flags;
@@ -262,6 +298,9 @@ pub fn name_color_choice(entity: &Entity, ctx: SelfContext<'_>) -> NameColorChoi
         return Row(ncol::DEAD);
     }
 
+    // 8/9 (belligerence) deliberately fall through: retail maps them to the PC
+    // row without returning, and every check below overwrites or matches that
+    // white — see `BELLIGERENT_PLAYER_ALLEGIANCE`.
     if (ALLEGIANCE_COLORED_MIN..=ALLEGIANCE_COLORED_MAX).contains(&flags.allegiance) {
         if let Some(&(_, row)) = ALLEGIANCE_COLOR_INDICES
             .iter()
@@ -755,6 +794,69 @@ mod tests {
     #[test]
     fn player_and_mob_allegiances_do_not_take_a_nation_row() {
         for allegiance in [0u8, 1] {
+            let mut pc = entity(EntityKind::Pc, STRANGER_ID);
+            pc.char_flags.allegiance = allegiance;
+            assert_eq!(
+                name_color_choice(&pc, solo(&[])),
+                NameColorChoice::Row(ncol::PC),
+                "allegiance {allegiance}"
+            );
+        }
+    }
+
+    /// Belligerence (base | 0x08 outside the Ferretory) takes no nation row:
+    /// retail maps 8/9 to the PC row without returning, so a belligerent player
+    /// draws plain white and a belligerent mob keeps its kind colour.
+    #[test]
+    fn belligerent_allegiances_fall_through_to_the_kind_colour() {
+        for allegiance in [BELLIGERENT_MOB_ALLEGIANCE, BELLIGERENT_PLAYER_ALLEGIANCE] {
+            let mut pc = entity(EntityKind::Pc, STRANGER_ID);
+            pc.char_flags.allegiance = allegiance;
+            assert_eq!(
+                name_color_choice(&pc, solo(&[])),
+                NameColorChoice::Row(ncol::PC),
+                "allegiance {allegiance}"
+            );
+
+            let mut m = mob(0);
+            m.char_flags.allegiance = allegiance;
+            assert_eq!(
+                name_color_choice(&m, solo(&[])),
+                NameColorChoice::Row(ncol::MOB),
+                "allegiance {allegiance}"
+            );
+        }
+    }
+
+    /// Retail's 8/9 white is set without returning: a claimed belligerent mob
+    /// still takes its claim colour, and a belligerent party mate still takes
+    /// the party row.
+    #[test]
+    fn belligerence_does_not_outrank_claim_or_party() {
+        let mut m = mob(MATE_ID);
+        m.char_flags.allegiance = BELLIGERENT_MOB_ALLEGIANCE;
+        assert_eq!(
+            name_color_choice(&m, solo(&[])),
+            NameColorChoice::Row(ncol::CLAIMED_BY_OTHER),
+            "the claim colour overwrites retail's 8/9 white"
+        );
+
+        let party = [member(SELF_ID, 0), member(STRANGER_ID, 0)];
+        let mut pc = entity(EntityKind::Pc, STRANGER_ID);
+        pc.char_flags.allegiance = BELLIGERENT_PLAYER_ALLEGIANCE;
+        assert_eq!(
+            name_color_choice(&pc, solo(&party)),
+            NameColorChoice::Row(ncol::PARTY),
+            "the party walk overwrites retail's 8/9 white"
+        );
+    }
+
+    /// Nation allegiance OR'd with belligerence (10–14) gets no allegiance
+    /// colour at all in retail — the switch leaves it on the dead-row default,
+    /// which resets to "no colour".
+    #[test]
+    fn nation_allegiance_with_belligerence_takes_no_colour() {
+        for allegiance in 10..=14 {
             let mut pc = entity(EntityKind::Pc, STRANGER_ID);
             pc.char_flags.allegiance = allegiance;
             assert_eq!(

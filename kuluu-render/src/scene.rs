@@ -242,7 +242,7 @@ pub struct EntitySyncQueries<'w, 's> {
         &'static mut MeshMaterial3d<StandardMaterial>,
         (With<WorldEntity>, Without<MorphIn>),
     >,
-    vis: Query<'w, 's, &'static mut Visibility, With<WorldEntity>>,
+    vis: Query<'w, 's, &'static mut Visibility, (With<WorldEntity>, Without<IsSelf>)>,
 }
 
 #[derive(SystemParam)]
@@ -519,19 +519,23 @@ pub fn apply_invis_flag_system(
     table: Res<EntityTable>,
     materials: Res<EntityMaterials>,
     mut q_roots: Query<(
+        Entity,
         &WorldEntity,
-        Option<&crate::ffxi_actor_render::FfxiRenderRoot>,
         Option<&MorphIn>,
         Option<&mut MeshMaterial3d<StandardMaterial>>,
     )>,
     mut other_vis: Query<&mut Visibility, Without<WorldEntity>>,
+    #[cfg(not(target_arch = "wasm32"))] model_roots: Query<
+        &crate::ffxi_actor_render::FfxiRenderRoot,
+    >,
 ) {
-    for (ent, root, morph, orb_mat) in &mut q_roots {
+    for (_bevy_entity, ent, morph, orb_mat) in &mut q_roots {
         let hide = table.get(ent.id).is_some_and(|r| r.invis_flag());
 
         // The skinned model is a separate root synced by world_id; hiding it never
         // touches the wire entity or its hitbox.
-        if let Some(rr) = root {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Ok(rr) = model_roots.get(_bevy_entity) {
             if let Ok(mut v) = other_vis.get_mut(rr.0) {
                 *v = if hide {
                     Visibility::Hidden
@@ -851,6 +855,61 @@ mod tests {
     use super::*;
 
     #[test]
+    fn entity_sync_preserves_first_person_self_visibility() {
+        let mut app = App::new();
+        app.init_resource::<SceneState>()
+            .init_resource::<EntityTable>()
+            .init_resource::<TrackedEntities>()
+            .init_resource::<crate::combat_stance::EntityPrediction>()
+            .init_resource::<crate::combat_stance::EntityMotion>()
+            .init_resource::<crate::combat_stance::AnimationBlends>()
+            .insert_resource(EntityMesh {
+                default: Handle::default(),
+                pc: Handle::default(),
+                mob: Handle::default(),
+                pet: Handle::default(),
+                morph_orb: Handle::default(),
+            })
+            .insert_resource(dummy_materials())
+            .add_systems(Update, sync_entities_system);
+        #[cfg(not(target_arch = "wasm32"))]
+        app.init_resource::<crate::dat_mzb::LastAutoLoadedZone>()
+            .init_resource::<crate::dat_mzb::LoadMzbInFlight>();
+        let player = app
+            .world_mut()
+            .spawn((
+                WorldEntity {
+                    id: 7,
+                    act_index: 0,
+                    kind: EntityKind::Pc,
+                },
+                IsSelf,
+                Transform::default(),
+                Visibility::Hidden,
+            ))
+            .id();
+        app.world_mut()
+            .resource_mut::<TrackedEntities>()
+            .by_id
+            .insert(7, player);
+        app.world_mut()
+            .resource_mut::<EntityTable>()
+            .set_self_id(Some(7));
+        for x in [0.0, 1.0, 2.0] {
+            let mut entity = pc_entity(7, false);
+            entity.pos.x = x;
+            let mut scene = app.world_mut().resource_mut::<SceneState>();
+            scene.snapshot.entities = vec![entity];
+            scene.dirty = true;
+            app.update();
+            assert_eq!(
+                app.world().get::<Visibility>(player),
+                Some(&Visibility::Hidden)
+            );
+        }
+    }
+
+    #[test]
     fn mount_actor_id_is_reversible_and_disjoint_from_server_ids() {
         // Largest unique_no LSB can build: (4<<28) | (zone<<12) | targid.
         let max_server_id = (4u32 << 28) | (0xFFFF << 12) | 0xFFF;
@@ -1069,6 +1128,7 @@ mod tests {
     /// Flags1.InvisFlag (bit 29) hides the actor root and blanks the placeholder orb,
     /// but must NOT hide the wire root — its transparent EntityHitbox child is what keeps
     /// an invisible player targetable. Kind-gated: a stray bit on a mob changes nothing.
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn invis_flag_hides_actor_root_but_keeps_wire_root_pickable() {
         let mut app = App::new();
